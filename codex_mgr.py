@@ -542,7 +542,7 @@ def silent_query_quota(profile_name, port=9299):
         if os.path.exists(src_folder):
             shutil.copytree(src_folder, os.path.join(temp_user_data, "Default", folder))
             
-    # 3. 读取 auth.json 里的 access_token 用于 Bearer 鉴权
+    # 3. 读取 auth.json 里的 access_token（仅作为备用，主要依赖 Cookie 鉴权）
     access_token = ""
     auth_path = os.path.join(backup_dir, "auth.json")
     if os.path.exists(auth_path):
@@ -631,19 +631,44 @@ def silent_query_quota(profile_name, port=9299):
         time.sleep(4.5)
         
         # 8. 在页面上下文中 fetch backend-api/codex/usage (使用异步全局变量轮询机制)
-        # 清空可能的旧数据
+        # 清空可能的旧数据，并把备用 Bearer Token 注入到页面全局变量
         send_cdp(ws, "Runtime.evaluate", {"expression": "window.__my_res = null;"}, req_id=3)
+        # 注入备用 token（用 JSON 序列化避免 JS 注入问题）
+        token_json = json.dumps(access_token)
+        send_cdp(ws, "Runtime.evaluate", {
+            "expression": f"window.__bearer_token = {token_json};"
+        }, req_id=4)
         
-        fetch_js = f"""
-        fetch('https://chatgpt.com/backend-api/codex/usage', {{
-            headers: {{ 'Authorization': 'Bearer {access_token}' }}
-        }}).then(r => r.json().catch(() => r.text())).then(data => {{
-            window.__my_res = data;
-        }}).catch(e => {{
+        fetch_js = """
+        // 主要策略：用浏览器本身的 Cookie 请求（Cookie 有效期远比 access_token 长）
+        // 这样即使 auth.json 里的 access_token 已过期，只要 Session Cookie 还有效，保活就不会失败
+        fetch('https://chatgpt.com/backend-api/codex/usage', {
+            credentials: 'include'
+        }).then(r => {
+            const status = r.status;
+            return r.json().catch(() => r.text()).then(data => ({ data, status }));
+        }).then(({ data, status }) => {
+            // 若 Cookie 鉴权成功，直接返回
+            if (status !== 401) {
+                window.__my_res = data;
+                return;
+            }
+            // Cookie 鉴权返回 401，尝试用 Bearer Token 作为备用
+            const bearerToken = window.__bearer_token;
+            if (!bearerToken) {
+                window.__my_res = data;  // 没有备用 token，直接返回 401 结果
+                return;
+            }
+            return fetch('https://chatgpt.com/backend-api/codex/usage', {
+                headers: { 'Authorization': 'Bearer ' + bearerToken }
+            }).then(r2 => r2.json().catch(() => r2.text())).then(data2 => {
+                window.__my_res = data2;
+            });
+        }).catch(e => {
             window.__my_res = 'FETCH_ERROR: ' + e.message;
-        }})
+        })
         """
-        send_cdp(ws, "Runtime.evaluate", {"expression": fetch_js}, req_id=4)
+        send_cdp(ws, "Runtime.evaluate", {"expression": fetch_js}, req_id=5)
         
         # 轮询 12 次 (最大等待 6 秒) 获取结果
         raw_val = None
@@ -652,7 +677,7 @@ def silent_query_quota(profile_name, port=9299):
             res = send_cdp(ws, "Runtime.evaluate", {
                 "expression": "window.__my_res",
                 "returnByValue": True
-            }, req_id=5 + i)
+            }, req_id=6 + i)
             val = res.get("result", {}).get("result", {}).get("value")
             if val is not None:
                 raw_val = val
@@ -666,6 +691,15 @@ def silent_query_quota(profile_name, port=9299):
                 if "rate_limit" in raw_val:
                     limits_info["rate_limit"] = raw_val["rate_limit"]
                     limits_info["status"] = "OK"
+                elif "error" in raw_val:
+                    # OpenAI 标准错误格式: {"error": {"code": "token_invalidated", ...}, "status": 401}
+                    error_obj = raw_val.get("error", {})
+                    error_code = str(error_obj.get("code", "")).lower()
+                    http_status = raw_val.get("status", 0)
+                    if http_status == 401 or "token" in error_code or "invalid" in error_code or "unauthorized" in error_code:
+                        limits_info["status"] = "Token Expired"
+                    else:
+                        limits_info["status"] = f"API Error: {error_obj.get('message', str(raw_val))}"
                 elif "detail" in raw_val:
                     if "unauthorized" in str(raw_val).lower():
                         limits_info["status"] = "Token Expired"
@@ -677,10 +711,10 @@ def silent_query_quota(profile_name, port=9299):
                 raw_text = str(raw_val)
                 if "challenge" in raw_text.lower() or "cloudflare" in raw_text.lower():
                     limits_info["status"] = "Blocked by Cloudflare"
-                elif "unauthorized" in raw_text.lower() or "token is missing" in raw_text.lower():
+                elif "unauthorized" in raw_text.lower() or "token is missing" in raw_text.lower() or "token_invalidated" in raw_text.lower():
                     limits_info["status"] = "Token Expired"
                 else:
-                    limits_info["status"] = "Parse Error"
+                    limits_info["status"] = f"Parse Error: {raw_text[:100]}"
         else:
             limits_info["status"] = "Empty Response"
             
@@ -771,15 +805,15 @@ def cmd_list(refresh=False):
     print(f"\n{BOLD}{CYAN}=== ChatGPT/Codex 账号管理列表 ==={RESET}")
     
     col_active = 10
-    col_profile = 30
-    col_email = 30
+    col_profile = 25
+    col_email = 45
     col_plan = 8
-    col_until = 26
+    col_until = 22
     
-    header = f"{'Active':<{col_active}}{'Profile Name':<{col_profile}}{'Email':<{col_email}}{'Plan':<{col_plan}}{'Subscription Until (UTC)':<{col_until}}{'Quota / Limit Info'}"
-    print("-" * len(header))
+    header = f"{'Active':<{col_active}}{'Profile Name':<{col_profile}}{'Email':<{col_email}}{'Plan':<{col_plan}}{'Subscription Until':<{col_until}}{'Quota / Limit Info'}"
+    print("-" * 135)
     print(f"{BOLD}{header}{RESET}")
-    print("-" * len(header))
+    print("-" * 135)
     
     for p in profiles:
         backup_dir = f"{BACKUP_PREFIX}_{p}"
@@ -884,10 +918,40 @@ def cmd_list(refresh=False):
             
         print(line)
         
-    print("-" * len(header))
+    print("-" * 135)
     if not refresh:
         print(f"提示: 以上额度用量基于缓存展示。运行 {BOLD}python3 codex_mgr.py list --refresh{RESET} 可静默现查最新额度。")
     print(f"提示: 后台守护服务每半小时会自动保活并刷新用量缓存。")
+
+def _pretty_status_desc(status):
+    """把接口底层的英文/异常状态翻译并附带人机友好的详细解释。"""
+    if not status:
+        return "Unknown"
+    if status == "OK":
+        return "OK"
+    if status == "Token Expired":
+        return "Token Expired (Session已失效/在其他设备被踢，需重新登录)"
+    if status == "Blocked by Cloudflare":
+        return "Blocked by Cloudflare (被 OpenAI 防机器人墙拦截，请尝试切换干净的节点)"
+    if status == "Empty Response":
+        return "Empty Response (服务器没有返回任何数据)"
+    
+    # 模糊匹配带有详情的状态
+    if status.startswith("Parse Error"):
+        detail = status.replace("Parse Error:", "").strip()
+        if not detail:
+            return "Parse Error (服务器返回的结构不符合用量接口标准)"
+        return f"Parse Error (接口返回解析失败，响应样本: {detail})"
+        
+    if status.startswith("API Error:"):
+        detail = status.replace("API Error:", "").strip()
+        return f"API Error (OpenAI API 报错: {detail})"
+        
+    if status.startswith("Error:"):
+        detail = status.replace("Error:", "").strip()
+        return f"Runtime Error (网络连接/CDP通信或底层进程异常: {detail})"
+        
+    return status
 
 def _log_status(ok, detail=""):
     """格式化步骤结果：OK / FAIL + 可选细节（避免 OK OK 重复）。"""
@@ -895,8 +959,8 @@ def _log_status(ok, detail=""):
     detail = (detail or "").strip()
     if not detail or detail == mark:
         return mark
-    return f"{mark}  {detail}"
-
+    pretty_detail = _pretty_status_desc(detail)
+    return f"{mark}  {pretty_detail}"
 
 def _is_query_ok(info):
     """额度/心跳查询是否成功。"""
@@ -988,7 +1052,8 @@ def cmd_wakeup():
     if results:
         for role, name, ok, detail in results:
             mark = "OK" if ok else "FAIL"
-            print(f"  [{mark}] ({role}) {name}: {detail}")
+            pretty_detail = _pretty_status_desc(detail)
+            print(f"  [{mark}] ({role}) {name}: {pretty_detail}")
     if revoked_accounts:
         print("警告: 以下账号 Session 已失效，需重新登录后执行 add 重建备份:")
         for name in revoked_accounts:
