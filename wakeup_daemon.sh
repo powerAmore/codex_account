@@ -25,7 +25,7 @@ start_daemon() {
         echo "守护进程启动成功！"
         echo "  - PID: ${PID}"
         echo "  - 日志文件: ${LOG_FILE}"
-        echo "  - 保活周期: 每 2 小时自动批量唤醒并更新限额缓存"
+        echo "  - 保活周期: 每半小时自动批量唤醒并更新限额缓存"
     else
         echo "守护进程启动失败，请检查日志: ${LOG_FILE}"
     fi
@@ -56,7 +56,7 @@ check_status() {
     if [ -n "$PID" ]; then
         echo "● Codex 守护进程状态: 正在运行"
         echo "  - PID: ${PID}"
-        echo "  - 运行周期: 每 2 小时"
+        echo "  - 运行周期: 每半小时"
         echo "  - 日志文件: ${LOG_FILE}"
         echo ""
         echo "最近 5 行日志:"

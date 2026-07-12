@@ -6,6 +6,7 @@ import base64
 import shutil
 import subprocess
 import time
+import datetime
 import urllib.request
 import urllib.error
 
@@ -171,8 +172,9 @@ def restore_profile(profile_name):
     return True
 
 def cmd_add(profile_name=None):
-    # 1. 尝试从当前的 auth.json 自动提取邮箱
+    # 1. 尝试从当前的 auth.json 自动提取姓名和邮箱
     detected_email = None
+    detected_name = None
     if os.path.exists(AUTH_FILE):
         try:
             with open(AUTH_FILE, "r") as f:
@@ -181,14 +183,30 @@ def cmd_add(profile_name=None):
                 if id_token:
                     payload = decode_jwt_payload(id_token)
                     detected_email = payload.get("email")
+                    detected_name = payload.get("name")
         except Exception:
             pass
 
     if not profile_name:
-        if detected_email:
+        if detected_name:
+            # 过滤只允许 valid_chars 字符，其它非合规字符和空格一律替换为下划线
+            valid_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.@")
+            candidate_name = "".join(c if c in valid_chars else "_" for c in detected_name)
+            while "__" in candidate_name:
+                candidate_name = candidate_name.replace("__", "_")
+            candidate_name = candidate_name.strip("_")
+            
+            # 校验别名唯一性
+            backup_dir = f"{BACKUP_PREFIX}_{candidate_name}"
+            if candidate_name and not os.path.exists(backup_dir):
+                profile_name = candidate_name
+                print(f"检测到当前登录的真实姓名: '{detected_name}'，自动命名为: '{profile_name}'")
+                
+        if not profile_name and detected_email:
             profile_name = detected_email
             print(f"检测到当前登录的邮箱: '{profile_name}'")
-        else:
+            
+        if not profile_name:
             print(f"{RED}错误: 未检测到任何登录状态，且未指定 Profile 名称。{RESET}")
             print("请登录 ChatGPT App 客户端后再试，或者指定别名：")
             print("  示例: python3 codex_mgr.py add my_alias")
@@ -380,7 +398,18 @@ def silent_query_quota(profile_name, port=9299):
         if os.path.exists(src_folder):
             shutil.copytree(src_folder, os.path.join(temp_user_data, "Default", folder))
             
-    # 3. headless 模式拉起独立进程 (使用绕过 Cloudflare 检测的参数)
+    # 3. 读取 auth.json 里的 access_token 用于 Bearer 鉴权
+    access_token = ""
+    auth_path = os.path.join(backup_dir, "auth.json")
+    if os.path.exists(auth_path):
+        try:
+            with open(auth_path, "r") as f:
+                auth_data = json.load(f)
+                access_token = auth_data.get("tokens", {}).get("access_token", "")
+        except Exception:
+            pass
+
+    # 4. headless 模式拉起独立进程 (使用绕过 Cloudflare 检测的参数)
     cmd = [
         "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
         f"--user-data-dir={temp_user_data}",
@@ -405,10 +434,10 @@ def silent_query_quota(profile_name, port=9299):
                 
     limits_info = {}
     try:
-        # 4. 等待拉起
-        time.sleep(3.0)
+        # 5. 等待拉起 (增加到 4 秒以确保端口已监听就绪)
+        time.sleep(4.0)
         
-        # 5. 获取已有标签页，如果没有则新建一个
+        # 6. 获取已有标签页，如果没有则新建一个
         list_url = f"http://127.0.0.1:{port}/json"
         req = urllib.request.Request(list_url, headers={"User-Agent": "curl/7.88.1"})
         ws_url = None
@@ -440,53 +469,71 @@ def silent_query_quota(profile_name, port=9299):
         if not ws_url:
             return {"status": "Failed to get tab websocket url"}
             
-        # 6. 使用 WebSocket 导航并读取内容
-        ws = websocket.create_connection(ws_url, timeout=8)
+        # 7. 使用 WebSocket 导航并读取内容
+        ws = websocket.create_connection(ws_url, timeout=15)
         
         # 启用 Runtime
         send_cdp(ws, "Runtime.enable", req_id=1)
         
-        # 导航到 chatgpt 主页以建立安全上下文域
-        send_cdp(ws, "Page.navigate", {"url": "https://chatgpt.com/"}, req_id=2)
+        # 发送导航命令到 chatgpt.com。
+        # 注意: 导航大页面可能耗时极长，我们通过 WebSocket 异步发送，并不阻塞等待 load 完成，以防止超时。
+        ws.send(json.dumps({
+            "id": 2,
+            "method": "Page.navigate",
+            "params": {"url": "https://chatgpt.com/"}
+        }))
         
-        # 等待主页基本加载
-        time.sleep(5.0)
+        # 强行等待 4.5 秒，让浏览器跳转并准备好基本的 chatgpt.com 的同源 Cookie 上下文域。
+        time.sleep(4.5)
         
-        # 7. 在页面上下文中直接 fetch backend-api 并等待 Promise 返回
-        fetch_js = "fetch('https://chatgpt.com/backend-api/models').then(r => r.text()).catch(e => 'FETCH_ERROR: ' + e.message)"
-        res = send_cdp(ws, "Runtime.evaluate", {
-            "expression": fetch_js,
-            "awaitPromise": True,
-            "returnByValue": True
-        }, req_id=3)
+        # 8. 在页面上下文中 fetch backend-api/codex/usage (使用异步全局变量轮询机制)
+        # 清空可能的旧数据
+        send_cdp(ws, "Runtime.evaluate", {"expression": "window.__my_res = null;"}, req_id=3)
+        
+        fetch_js = f"""
+        fetch('https://chatgpt.com/backend-api/codex/usage', {{
+            headers: {{ 'Authorization': 'Bearer {access_token}' }}
+        }}).then(r => r.json().catch(() => r.text())).then(data => {{
+            window.__my_res = data;
+        }}).catch(e => {{
+            window.__my_res = 'FETCH_ERROR: ' + e.message;
+        }})
+        """
+        send_cdp(ws, "Runtime.evaluate", {"expression": fetch_js}, req_id=4)
+        
+        # 轮询 12 次 (最大等待 6 秒) 获取结果
+        raw_val = None
+        for i in range(12):
+            time.sleep(0.5)
+            res = send_cdp(ws, "Runtime.evaluate", {
+                "expression": "window.__my_res",
+                "returnByValue": True
+            }, req_id=5 + i)
+            val = res.get("result", {}).get("result", {}).get("value")
+            if val is not None:
+                raw_val = val
+                break
+                
         ws.close()
         
-        raw_text = res.get("result", {}).get("result", {}).get("value", "")
-        
-        # 8. 解析获取的数据
-        if raw_text:
-            try:
-                parsed_json = json.loads(raw_text)
-                # 尝试抓取 GPT-4o 或者是 Codex 的使用 caps
-                models = parsed_json.get("models", [])
-                for m in models:
-                    mid = m.get("id", "")
-                    # 我们过滤出 GPT-4o 或者主要的模型
-                    if "gpt-4o" in mid or "gpt-4" in mid:
-                        constraints = m.get("constraints", {})
-                        message_cap = m.get("message_cap")
-                        # 查找是否有具体的 cap 和限制
-                        if message_cap:
-                            limits_info[mid] = message_cap
-                if not limits_info:
-                    limits_info["status"] = "Normal (No active limits)"
-                else:
+        # 9. 解析获取的数据
+        if raw_val:
+            if isinstance(raw_val, dict):
+                if "rate_limit" in raw_val:
+                    limits_info["rate_limit"] = raw_val["rate_limit"]
                     limits_info["status"] = "OK"
-            except Exception:
-                # 可能是 cloudflare 阻断返回了 HTML，或者未登录
+                elif "detail" in raw_val:
+                    if "unauthorized" in str(raw_val).lower():
+                        limits_info["status"] = "Token Expired"
+                    else:
+                        limits_info["status"] = f"API Error: {raw_val.get('detail')}"
+                else:
+                    limits_info["status"] = "Parse Error"
+            else:
+                raw_text = str(raw_val)
                 if "challenge" in raw_text.lower() or "cloudflare" in raw_text.lower():
                     limits_info["status"] = "Blocked by Cloudflare"
-                elif "unauthorized" in raw_text.lower():
+                elif "unauthorized" in raw_text.lower() or "token is missing" in raw_text.lower():
                     limits_info["status"] = "Token Expired"
                 else:
                     limits_info["status"] = "Parse Error"
@@ -496,7 +543,7 @@ def silent_query_quota(profile_name, port=9299):
     except Exception as e:
         limits_info["status"] = f"Error: {e}"
     finally:
-        # 9. 彻底清理无头进程
+        # 10. 彻底清理无头进程
         proc.terminate()
         try:
             proc.wait(timeout=2)
@@ -552,12 +599,19 @@ def cmd_list(refresh=False):
         save_usage_cache(usage_cache)
         print("")
 
-    # 打印表格
+    # 5. 打印表格 (宽版完美对齐)
     print(f"\n{BOLD}{CYAN}=== ChatGPT/Codex 账号管理列表 ==={RESET}")
-    header = f"{'Active':<8}{'Profile Name':<16}{'Email':<30}{'Plan':<10}{'Subscription Until (UTC)':<24}{'Quota / Limit Info'}"
-    print("-" * len(header) * 1)
+    
+    col_active = 10
+    col_profile = 30
+    col_email = 30
+    col_plan = 8
+    col_until = 26
+    
+    header = f"{'Active':<{col_active}}{'Profile Name':<{col_profile}}{'Email':<{col_email}}{'Plan':<{col_plan}}{'Subscription Until (UTC)':<{col_until}}{'Quota / Limit Info'}"
+    print("-" * len(header))
     print(f"{BOLD}{header}{RESET}")
-    print("-" * len(header) * 1)
+    print("-" * len(header))
     
     for p in profiles:
         backup_dir = f"{BACKUP_PREFIX}_{p}"
@@ -566,11 +620,7 @@ def cmd_list(refresh=False):
         email = "Unknown"
         plan = "Unknown"
         until = "Unknown"
-        status_color = RESET
-        is_active_str = ""
-        
-        if p == current:
-            is_active_str = f"{GREEN}* ACTIVE{RESET}"
+        is_active = (p == current)
         
         # 本地解析 JWT 凭证
         if os.path.exists(auth_path):
@@ -586,7 +636,6 @@ def cmd_list(refresh=False):
                         plan = auth_sec.get("chatgpt_plan_type", "free").upper()
                         until_raw = auth_sec.get("chatgpt_subscription_active_until", "Unknown")
                         if until_raw != "Unknown":
-                            # 简短化时间
                             until = until_raw.split('T')[0]
             except Exception:
                 pass
@@ -597,26 +646,49 @@ def cmd_list(refresh=False):
         limits_status = limits.get("status", "No Data")
         
         # 格式化用量限制展示
-        limit_desc = []
-        for k, v in limits.items():
-            if k != "status":
-                # v 可能是个字典，比如 {"max_messages": 80, "window_size_days": 7} 或者其他
-                # 我们尽量简写它
-                model_short = k.replace("gpt-4o-", "").replace("gpt-4-", "")
-                if isinstance(v, dict):
-                    limit_desc.append(f"{model_short}: {v.get('max_messages')}/{v.get('window_size_days')}d")
-                else:
-                    limit_desc.append(f"{model_short}: {v}")
+        quota_str = ""
+        if limits_status == "Token Expired":
+            quota_str = f"{RED}Token Expired ❌{RESET}"
+        elif limits_status == "Blocked by Cloudflare":
+            quota_str = f"{YELLOW}CF Check Failed ⚠️{RESET}"
+        elif limits_status == "No Data":
+            quota_str = f"{YELLOW}No Data (请使用 --refresh 现查){RESET}"
+        elif limits_status == "OK" and "rate_limit" in limits:
+            rl = limits["rate_limit"]
+            pw = rl.get("primary_window", {})
+            sw = rl.get("secondary_window", {})
+            
+            # 计算剩余百分比 (剩余 = 100 - 已用)
+            pct_5h = 100 - pw.get("used_percent", 0)
+            pct_1w = 100 - sw.get("used_percent", 0)
+            
+            # 如果剩余配额偏低，以红色警示；健康状态下以绿色呈现
+            pct_5h_str = f"{RED}{pct_5h}%{RESET}" if pct_5h <= 15 else f"{GREEN}{pct_5h}%{RESET}"
+            pct_1w_str = f"{RED}{pct_1w}%{RESET}" if pct_1w <= 15 else f"{GREEN}{pct_1w}%{RESET}"
+            
+            # 格式化 5h 的重置时间戳 (转换为本地 12小时 AM/PM 格式，如 5:52 PM)
+            r5h_str = ""
+            r5h_ts = pw.get("reset_at")
+            if r5h_ts:
+                try:
+                    dt_5h = datetime.datetime.fromtimestamp(r5h_ts)
+                    r5h_str = " " + dt_5h.strftime("%I:%M %p").lstrip('0')
+                except Exception:
+                    pass
                     
-        if limit_desc:
-            quota_str = ", ".join(limit_desc)
+            # 格式化 1w 的重置时间戳 (转换为英文月日格式，如 Jul 18)
+            r1w_str = ""
+            r1w_ts = sw.get("reset_at")
+            if r1w_ts:
+                try:
+                    dt_1w = datetime.datetime.fromtimestamp(r1w_ts)
+                    r1w_str = " " + dt_1w.strftime("%b %d")
+                except Exception:
+                    pass
+                    
+            quota_str = f"5小时: {pct_5h_str}{r5h_str} | 1周: {pct_1w_str}{r1w_str}"
         else:
-            if limits_status == "Token Expired":
-                quota_str = f"{RED}Token Expired ❌{RESET}"
-            elif limits_status == "Blocked by Cloudflare":
-                quota_str = f"{YELLOW}CF Check Failed ⚠️{RESET}"
-            else:
-                quota_str = limits_status
+            quota_str = limits_status
                 
         # 加上更新时间指示
         ts = usage_data.get("timestamp")
@@ -627,13 +699,27 @@ def cmd_list(refresh=False):
             else:
                 quota_str += f" ({mins_ago}分钟前)"
                 
-        active_col = f"{is_active_str:<17}" if is_active_str else f"{'':<8}"
-        print(f"{active_col}{p:<16}{email:<30}{plan:<10}{until:<24}{quota_str}")
+        # 纯文本对齐，避免 ANSI 导致排版崩塌
+        active_val = "* ACTIVE" if is_active else ""
+        p_val = p
+        email_val = email
+        plan_val = plan
+        until_val = until
+        quota_val = quota_str  # quota_str 放在最后，即使带颜色也不会影响前面对齐
         
-    print("-" * len(header) * 1)
+        # 组装行
+        line = f"{active_val:<{col_active}}{p_val:<{col_profile}}{email_val:<{col_email}}{plan_val:<{col_plan}}{until_val:<{col_until}}{quota_val}"
+        
+        # 对活动账号标志进行着色
+        if "* ACTIVE" in line:
+            line = line.replace("* ACTIVE", f"{GREEN}* ACTIVE{RESET}")
+            
+        print(line)
+        
+    print("-" * len(header))
     if not refresh:
         print(f"提示: 以上额度用量基于缓存展示。运行 {BOLD}python3 codex_mgr.py list --refresh{RESET} 可静默现查最新额度。")
-    print(f"提示: 后台守护服务每 2 小时会自动保活并刷新用量缓存。")
+    print(f"提示: 后台守护服务每半小时会自动保活并刷新用量缓存。")
 
 def cmd_wakeup():
     profiles = get_profiles()
@@ -682,12 +768,12 @@ def cmd_wakeup():
 
 def cmd_daemon():
     print(f"{GREEN}Codex 账号管理后台守护进程已启动。{RESET}")
-    print("将每隔 2 小时自动批量唤醒保活并更新额度缓存...")
+    print("将每隔半小时自动批量唤醒保活并更新额度缓存...")
     try:
         while True:
             cmd_wakeup()
-            print(f"\n批量唤醒完成。等待 2 小时以进行下一次保活...")
-            time.sleep(7200)
+            print(f"\n批量唤醒完成。等待半小时以进行下一次保活...")
+            time.sleep(1800)
     except KeyboardInterrupt:
         print("\n守护进程已安全退出。")
 

@@ -16,7 +16,7 @@
     *   `wakeup`：批量顺序静默刷新并更新所有账号的会话 Token。
     *   `daemon`：常驻后台定时执行唤醒。
 2.  **`wakeup_daemon.sh`**：守护进程控制脚本。
-    *   `./wakeup_daemon.sh start`：启动常驻后台守护服务，每 2 小时自动批量刷新保活并更新额度缓存。
+    *   `./wakeup_daemon.sh start`：启动常驻后台守护服务，每半小时自动批量刷新保活并更新额度缓存。
     *   `./wakeup_daemon.sh stop`：停止后台守护服务。
     *   `./wakeup_daemon.sh status`：查看运行状态及最近日志。
     *   `./wakeup_daemon.sh log`：实时查看输出日志。
