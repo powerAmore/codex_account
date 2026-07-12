@@ -81,47 +81,90 @@ def decode_jwt_payload(token):
 
 def kill_chatgpt_processes():
     print("正在安全关闭 ChatGPT / Codex 进程...")
-    subprocess.run(["pkill", "-f", "ChatGPT"], capture_output=True)
-    subprocess.run(["pkill", "-f", "Codex"], capture_output=True)
+    # 覆盖主程序、Framework 子进程、内置 codex app-server、Computer Use 与 Chrome 扩展宿主
+    patterns = [
+        "ChatGPT.app",
+        "ChatGPT",
+        "Codex Framework",
+        "Codex (Service)",
+        "Codex (Renderer)",
+        "/Contents/Resources/codex",
+        "SkyComputerUseService",
+        "ChatGPT for Chrome",
+        "com.openai.codex",
+    ]
+    for pat in patterns:
+        subprocess.run(["pkill", "-f", pat], capture_output=True)
     time.sleep(1.5)
-    
-    # 双重检查
-    res = subprocess.run(["pgrep", "-f", "ChatGPT.app"], capture_output=True)
-    if res.returncode == 0:
-        print(f"{YELLOW}提示: 检测到 ChatGPT 仍有残余进程，强行关闭中...{RESET}")
-        subprocess.run(["pkill", "-9", "-f", "ChatGPT"], capture_output=True)
-        subprocess.run(["pkill", "-9", "-f", "Codex"], capture_output=True)
+
+    # 双重检查：仍有主程序或 app-server 则强杀
+    still_running = False
+    for pat in ["ChatGPT.app", "/Contents/Resources/codex", "SkyComputerUseService"]:
+        res = subprocess.run(["pgrep", "-f", pat], capture_output=True)
+        if res.returncode == 0:
+            still_running = True
+            break
+    if still_running:
+        print(f"{YELLOW}提示: 检测到 ChatGPT/Codex 仍有残余进程，强行关闭中...{RESET}")
+        for pat in patterns:
+            subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
         time.sleep(1.0)
 
-def backup_profile(profile_name):
+def backup_profile(profile_name, quiet=False):
+    """将当前登录态备份到指定 Profile 目录。返回 True 表示成功，False 表示失败。"""
     backup_dir = f"{BACKUP_PREFIX}_{profile_name}"
-    os.makedirs(backup_dir, exist_ok=True)
-    
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+    except Exception as e:
+        if not quiet:
+            print(f"[{RED}ERROR{RESET}] 无法创建备份目录 '{backup_dir}': {e}")
+        return False
+
+    success = True
+
     # 备份 App Support 核心文件
     app_support_backup = os.path.join(backup_dir, "app_support", "Default")
     os.makedirs(app_support_backup, exist_ok=True)
-    
+
     default_dir = os.path.join(APP_SUPPORT_DIR, "Default")
     if os.path.exists(default_dir):
-        print(f"正在增量备份活跃账号 Cookies & 本地存储...")
+        if not quiet:
+            print(f"正在增量备份活跃账号 Cookies & 本地存储...")
         # 仅备份核心认证文件以极大地压缩体积
         for item in ["Cookies", "Cookies-journal"]:
             src = os.path.join(default_dir, item)
             if os.path.exists(src):
-                shutil.copy2(src, os.path.join(app_support_backup, item))
-                
+                try:
+                    shutil.copy2(src, os.path.join(app_support_backup, item))
+                except Exception as e:
+                    if not quiet:
+                        print(f"[{RED}ERROR{RESET}] 备份 {item} 失败: {e}")
+                    success = False
+
         # 复制 Local Storage / Session Storage
         for folder in ["Local Storage", "Session Storage"]:
             src_folder = os.path.join(default_dir, folder)
             dst_folder = os.path.join(app_support_backup, folder)
             if os.path.exists(src_folder):
-                if os.path.exists(dst_folder):
-                    shutil.rmtree(dst_folder)
-                shutil.copytree(src_folder, dst_folder)
-    
+                try:
+                    if os.path.exists(dst_folder):
+                        shutil.rmtree(dst_folder)
+                    shutil.copytree(src_folder, dst_folder)
+                except Exception as e:
+                    if not quiet:
+                        print(f"[{RED}ERROR{RESET}] 备份 '{folder}' 失败: {e}")
+                    success = False
+
     # 备份 auth.json
     if os.path.exists(AUTH_FILE):
-        shutil.copy2(AUTH_FILE, os.path.join(backup_dir, "auth.json"))
+        try:
+            shutil.copy2(AUTH_FILE, os.path.join(backup_dir, "auth.json"))
+        except Exception as e:
+            if not quiet:
+                print(f"[{RED}ERROR{RESET}] 备份 auth.json 失败: {e}")
+            success = False
+
+    return success
 
 def restore_profile(profile_name):
     backup_dir = f"{BACKUP_PREFIX}_{profile_name}"
@@ -167,7 +210,7 @@ def restore_profile(profile_name):
             os.remove(AUTH_FILE)
         except Exception:
             pass
-            
+
     set_current_active(profile_name)
     return True
 
@@ -187,6 +230,27 @@ def cmd_add(profile_name=None):
         except Exception:
             pass
 
+    # 2. 在做任何操作之前，先扫描所有现有 Profile，检查是否已有相同邮箱账号
+    #    防止同一账号以不同名字被重复保存
+    if detected_email:
+        existing_profiles = get_profiles()
+        for ep in existing_profiles:
+            ep_auth = os.path.join(f"{BACKUP_PREFIX}_{ep}", "auth.json")
+            if os.path.exists(ep_auth):
+                try:
+                    with open(ep_auth, "r") as f:
+                        ep_data = json.load(f)
+                    ep_token = ep_data.get("tokens", {}).get("id_token")
+                    if ep_token:
+                        ep_payload = decode_jwt_payload(ep_token)
+                        if ep_payload.get("email") == detected_email:
+                            print(f"{YELLOW}提示: 当前登录的账号 ({detected_email}) 已经以 Profile '{ep}' 保存过了。{RESET}")
+                            print(f"如果您想更新该 Profile 的备份，请直接切换到它：python3 codex_mgr.py switch {ep}")
+                            print("无需重复添加。")
+                            return
+                except Exception:
+                    pass
+
     if not profile_name:
         if detected_name:
             # 过滤只允许 valid_chars 字符，其它非合规字符和空格一律替换为下划线
@@ -195,56 +259,137 @@ def cmd_add(profile_name=None):
             while "__" in candidate_name:
                 candidate_name = candidate_name.replace("__", "_")
             candidate_name = candidate_name.strip("_")
-            
-            # 校验别名唯一性
-            backup_dir = f"{BACKUP_PREFIX}_{candidate_name}"
-            if candidate_name and not os.path.exists(backup_dir):
+
+            if candidate_name:
+                backup_dir_check = f"{BACKUP_PREFIX}_{candidate_name}"
+                if os.path.exists(backup_dir_check):
+                    # 名字已存在但邮箱不同（上方已排除邮箱重复），说明是同名不同人，加数字后缀
+                    suffix = 2
+                    while os.path.exists(f"{BACKUP_PREFIX}_{candidate_name}_{suffix}"):
+                        suffix += 1
+                    candidate_name = f"{candidate_name}_{suffix}"
                 profile_name = candidate_name
                 print(f"检测到当前登录的真实姓名: '{detected_name}'，自动命名为: '{profile_name}'")
-                
-        if not profile_name and detected_email:
-            profile_name = detected_email
-            print(f"检测到当前登录的邮箱: '{profile_name}'")
-            
+
         if not profile_name:
             print(f"{RED}错误: 未检测到任何登录状态，且未指定 Profile 名称。{RESET}")
             print("请登录 ChatGPT App 客户端后再试，或者指定别名：")
             print("  示例: python3 codex_mgr.py add my_alias")
             return
-            
+
     # 限制名称格式
     valid_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.@")
     if not all(c in valid_chars for c in profile_name):
         print(f"{RED}错误: Profile 名称只允许英文字母、数字、下划线、连字符、点和 @ 符号。{RESET}")
         return
-        
+
     backup_dir = f"{BACKUP_PREFIX}_{profile_name}"
     if os.path.exists(backup_dir):
         print(f"{RED}错误: 账号 Profile '{profile_name}' 已经存在。{RESET}")
         return
 
-    # 1. 退出进程以保证文件拷贝安全完整
+    # 3. 退出进程以保证文件拷贝安全完整
     print(f"正在安全关闭 ChatGPT / Codex 进程...")
     kill_chatgpt_processes()
-    
-    # 2. 对当前可能活跃的旧 Profile 执行最新的增量备份
+
+    # 4. 对当前可能活跃的旧 Profile 执行最新的增量备份
     current = get_current_active()
     if current:
         print(f"正在增量备份当前活跃账号 '{current}' 的最新状态...")
         backup_profile(current)
-        
-    # 3. 创建新 Profile 目录并备份当前数据
+
+    # 5. 创建新 Profile 目录并备份当前数据
     print(f"正在将当前登录态保存为新 Profile: '{profile_name}'...")
     os.makedirs(backup_dir, exist_ok=True)
     backup_profile(profile_name)
     set_current_active(profile_name)
     print(f"{GREEN}账号 Profile '{profile_name}' 创建并备份成功！{RESET}")
-    
-    # 4. 重新拉起客户端
+
+
+    # 6. 重新拉起客户端
     print("正在重新打开 ChatGPT 应用程序...")
     subprocess.run(["open", "-a", "/Applications/ChatGPT.app"])
 
+
 def cmd_switch(target_profile):
+    current = get_current_active()
+    
+    # 特殊指令: 切换到一个干净的“未登录”环境，用于添加/登录全新账号
+    if target_profile.lower() in ["new", "--new"]:
+        kill_chatgpt_processes()
+        
+        # 漏洞 A 修复：如果 current 标记为空，但实际上本地有已登录的数据（例如未记录的野生登录态）
+        if not current:
+            detected_name = None
+            if os.path.exists(AUTH_FILE):
+                try:
+                    with open(AUTH_FILE, "r") as f:
+                        auth_data = json.load(f)
+                        id_token = auth_data.get("tokens", {}).get("id_token")
+                        if id_token:
+                            payload = decode_jwt_payload(id_token)
+                            detected_name = payload.get("name")
+                except Exception:
+                    pass
+            
+            if detected_name:
+                valid_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.@")
+                candidate_name = "".join(c if c in valid_chars else "_" for c in detected_name)
+                while "__" in candidate_name:
+                    candidate_name = candidate_name.replace("__", "_")
+                candidate_name = candidate_name.strip("_")
+                current = candidate_name
+                print(f"检测到本地有未被记录的活跃登录账号，自动识别并关联为 Profile: '{current}'")
+            elif os.path.exists(AUTH_FILE) or os.path.exists(os.path.join(APP_SUPPORT_DIR, "Default", "Cookies")):
+                current = "auto_saved_profile"
+                print(f"检测到本地有未被记录的登录数据，已自动为您保存为安全备份: '{current}' (防止清空丢失)")
+                
+        if current:
+            print(f"正在增量备份当前账号 '{current}' 的最新状态...")
+            backup_ok = backup_profile(current)
+            if not backup_ok:
+                print(f"{RED}[安全中止] 账号 '{current}' 备份失败！为保护您的账号数据，已取消清空操作。{RESET}")
+                print("请检查磁盘空间或文件权限后重试。")
+                return
+            print(f"{GREEN}备份成功，账号数据已安全保存。{RESET}")
+            
+        print("正在重置客户端运行环境，创造干净的“未登录”状态...")
+        if os.path.exists(APP_SUPPORT_DIR):
+            try:
+                shutil.rmtree(APP_SUPPORT_DIR)
+            except Exception as e:
+                print(f"{RED}清空缓存目录失败: {e}{RESET}")
+                print("操作已中止，您的账号数据未受影响。")
+                return
+
+        os.makedirs(APP_SUPPORT_DIR, exist_ok=True)
+
+        # 关键：必须同步清除 ~/.codex/auth.json。
+        # 新版 ChatGPT/Codex 客户端会通过内置 codex app-server 读取该文件自动恢复登录态；
+        # 若只清空 Application Support/Codex 而保留 auth.json，重启后仍会显示旧账号。
+        if os.path.exists(AUTH_FILE):
+            try:
+                os.remove(AUTH_FILE)
+                print("已清除 CLI/App 共享凭证文件 auth.json（防止自动恢复旧登录）。")
+            except Exception as e:
+                print(f"{RED}清除 auth.json 失败: {e}{RESET}")
+                print("操作已中止。请检查文件权限后重试，以免客户端继续自动登录旧账号。")
+                return
+
+        if os.path.exists(ACTIVE_FILE):
+            try:
+                os.remove(ACTIVE_FILE)
+            except Exception:
+                pass
+
+        print(f"\n{GREEN}成功重置客户端！当前已处于干净的“未登录”状态。{RESET}")
+        print("正在拉起 ChatGPT 应用程序...")
+        print(f"{BOLD}提示: 请在弹出的客户端窗口中，直接输入并登录您的第二个新账号。{RESET}")
+        print(f"提示: 登录成功后，在终端运行 {BOLD}python3 codex_mgr.py add{RESET} 即可将此新账号自动完成备份。")
+
+        subprocess.run(["open", "-a", "/Applications/ChatGPT.app"])
+        return
+
     # 1. 获取所有可用的 Profile 列表
     parent_dir = os.path.expanduser("~/Library/Application Support")
     prefix = os.path.basename(BACKUP_PREFIX)
@@ -272,7 +417,6 @@ def cmd_switch(target_profile):
             print("请指定更精确的名称。")
             return
 
-    current = get_current_active()
     if current == target_profile:
         print(f"您当前已处于账号 '{target_profile}' 下！正在重新打开 App...")
         subprocess.run(["open", "-a", "/Applications/ChatGPT.app"])
@@ -281,7 +425,7 @@ def cmd_switch(target_profile):
     backup_dir = f"{BACKUP_PREFIX}_{target_profile}"
     if not os.path.exists(backup_dir):
         print(f"{RED}错误: 账号 Profile '{target_profile}' 不存在。{RESET}")
-        print(f"提示: 请先运行 'python3 codex_mgr.py add' 将您当前的登录状态自动保存。")
+        print(f"提示: 若要登录并添加新账号，请运行: {BOLD}python3 codex_mgr.py switch new{RESET}")
         return
         
     # 1. 退出进程
@@ -549,8 +693,32 @@ def silent_query_quota(profile_name, port=9299):
             proc.wait(timeout=2)
         except Exception:
             proc.kill()
-        
-        # 清理临时 userData
+
+        # 11. 把无头实例运行后可能更新的 Cookies / LocalStorage 拷回备份目录
+        #     （服务器可能下发了新的滚动 Session Cookie，不拷回则下次唤醒用的是旧 Cookie）
+        try:
+            tmp_default = os.path.join(temp_user_data, "Default")
+            backup_default = os.path.join(backup_dir, "app_support", "Default")
+            os.makedirs(backup_default, exist_ok=True)
+
+            for item in ["Cookies", "Cookies-journal"]:
+                src = os.path.join(tmp_default, item)
+                dst = os.path.join(backup_default, item)
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+
+            for folder in ["Local Storage", "Session Storage"]:
+                src_folder = os.path.join(tmp_default, folder)
+                dst_folder = os.path.join(backup_default, folder)
+                if os.path.exists(src_folder):
+                    if os.path.exists(dst_folder):
+                        shutil.rmtree(dst_folder)
+                    shutil.copytree(src_folder, dst_folder)
+        except Exception as e:
+            # 拷回失败不影响主流程，仅记录
+            pass
+
+        # 12. 清理临时 userData
         try:
             shutil.rmtree(temp_user_data)
         except Exception:
@@ -721,61 +889,159 @@ def cmd_list(refresh=False):
         print(f"提示: 以上额度用量基于缓存展示。运行 {BOLD}python3 codex_mgr.py list --refresh{RESET} 可静默现查最新额度。")
     print(f"提示: 后台守护服务每半小时会自动保活并刷新用量缓存。")
 
+def _log_status(ok, detail=""):
+    """格式化步骤结果：OK / FAIL + 可选细节（避免 OK OK 重复）。"""
+    mark = "OK" if ok else "FAIL"
+    detail = (detail or "").strip()
+    if not detail or detail == mark:
+        return mark
+    return f"{mark}  {detail}"
+
+
+def _is_query_ok(info):
+    """额度/心跳查询是否成功。"""
+    return (info or {}).get("status") == "OK"
+
+
 def cmd_wakeup():
+    """
+    执行一轮账号保活与额度刷新。
+
+    处理分工：
+      · 前台活跃账号：
+          1) live → 备份（同步 App 正在使用的最新 Cookie/Token，不关闭 App）
+          2) 无头额度查询 + Session 校验，并把可能滚动的 Cookie 写回备份
+             （前台 App 自身心跳已维持 live Session；此处主要保备份与额度缓存）
+      · 后台账号：
+          无头心跳保活 + 额度刷新 + Cookie 回写备份（防止长期不用掉登）
+    """
+    sep = "=" * 60
+    thin = "-" * 60
+
     profiles = get_profiles()
     if not profiles:
-        print("未发现任何可唤醒的账号 Profile。")
+        print(sep)
+        print("保活跳过: 未发现任何账号 Profile")
+        print(sep)
         return
-        
-    original = get_current_active()
-    print(f"=== 开始批量唤醒保活所有 ChatGPT 账号 (总共 {len(profiles)} 个) ===")
-    
-    # 确保当前活跃账号的数据先保存
-    if original:
-        print(f"正在保存当前活跃账号 '{original}' 的最新状态...")
-        backup_profile(original)
-        
+
+    current_active = get_current_active()
+    # 防并发/防覆盖：无 active 标定通常意味着正在 switch new 登录新号
+    if not current_active:
+        print(sep)
+        print("保活跳过: 当前无活跃账号标定")
+        print("原因: 可能正处于 switch new 登录新号流程中")
+        print("动作: 已跳过本轮，避免覆盖前台正在登录的数据")
+        print(sep)
+        return
+
+    background_profiles = [p for p in profiles if p != current_active]
     usage_cache = load_usage_cache()
-    
-    for i, p in enumerate(profiles):
-        print("\n-----------------------------------")
-        print(f"[{i+1}/{len(profiles)}] 正在载入并刷新账号: {p}")
-        restore_profile(p)
-        
-        # 启动客户端暴露调试端口，主动执行 models fetch 刷新 Token 并获取额度
-        print("正在以无头静默模式拉起客户端进行心跳刷新...")
-        info = silent_query_quota(p)
-        usage_cache[p] = {
-            "limits": info,
-            "timestamp": time.time()
-        }
-        
-        # 主动备份更新后的 Token (因为 silent_query_quota 可能促使客户端在后台更新了 auth.json)
-        print("正在将刷新后的最新状态存入备份...")
-        backup_profile(p)
-        
-    # 保存用量缓存
-    save_usage_cache(usage_cache)
-    
-    print("\n-----------------------------------")
-    if original:
-        print(f"正在恢复切换到最初的活跃账号: {original}")
-        restore_profile(original)
-        # 重新正常拉起主客户端
-        subprocess.run(["open", "-a", "/Applications/ChatGPT.app"])
+    revoked_accounts = []
+    results = []  # [(role, name, ok, detail), ...]
+
+    print(sep)
+    print("保活周期开始")
+    print(f"  前台活跃: {current_active}")
+    if background_profiles:
+        print(f"  后台账号: {', '.join(background_profiles)}  (共 {len(background_profiles)} 个)")
     else:
-        print("所有账号唤醒完成！")
+        print("  后台账号: (无)")
+    print("  说明: 前台由 App 自身维持 live Session；本轮同步备份并校验额度/Token")
+    print(thin)
+
+    # ── 前台活跃账号 ──────────────────────────────────────────────
+    print(f"[前台] {current_active}")
+    sync_ok = backup_profile(current_active, quiet=True)
+    print(f"  · 同步 live → 备份 ........... {_log_status(sync_ok)}")
+    if not sync_ok:
+        results.append(("前台", current_active, False, "备份同步失败"))
+    else:
+        print(f"  · 额度查询 / Session 校验 ... 进行中")
+        active_info = silent_query_quota(current_active)
+        status = active_info.get("status", "Unknown")
+        ok = _is_query_ok(active_info)
+        print(f"  · 额度查询 / Session 校验 ... {_log_status(ok, status)}")
+        _check_token_status(current_active, active_info, revoked_accounts)
+        usage_cache[current_active] = {"limits": active_info, "timestamp": time.time()}
+        results.append(("前台", current_active, ok, status))
+
+    # ── 后台账号 ──────────────────────────────────────────────────
+    for i, p in enumerate(background_profiles, 1):
+        print(f"[后台 {i}/{len(background_profiles)}] {p}")
+        print(f"  · 无头心跳保活 ............. 进行中")
+        info = silent_query_quota(p)
+        status = info.get("status", "Unknown")
+        ok = _is_query_ok(info)
+        print(f"  · 无头心跳保活 ............. {_log_status(ok, status)}")
+        _check_token_status(p, info, revoked_accounts)
+        usage_cache[p] = {"limits": info, "timestamp": time.time()}
+        results.append(("后台", p, ok, status))
+
+    save_usage_cache(usage_cache)
+
+    # ── 汇总 ──────────────────────────────────────────────────────
+    ok_n = sum(1 for r in results if r[2])
+    fail_n = len(results) - ok_n
+    print(thin)
+    print(f"本轮结果: 成功 {ok_n}  |  失败 {fail_n}  |  Session 失效 {len(revoked_accounts)}")
+    if results:
+        for role, name, ok, detail in results:
+            mark = "OK" if ok else "FAIL"
+            print(f"  [{mark}] ({role}) {name}: {detail}")
+    if revoked_accounts:
+        print("警告: 以下账号 Session 已失效，需重新登录后执行 add 重建备份:")
+        for name in revoked_accounts:
+            print(f"  ! {name}  ->  python3 codex_mgr.py switch {name}")
+    print(f"前台客户端: 未关闭、未切换 (前台账号 '{current_active}' 使用中)")
+    print(sep)
+
+
+def _check_token_status(profile_name, info, revoked_accounts):
+    """检测账号 session 是否被服务器撤销；失效时仅记入列表，汇总区统一打印。"""
+    if (info or {}).get("status") == "Token Expired":
+        if profile_name not in revoked_accounts:
+            revoked_accounts.append(profile_name)
+
 
 def cmd_daemon():
-    print(f"{GREEN}Codex 账号管理后台守护进程已启动。{RESET}")
-    print("将每隔半小时自动批量唤醒保活并更新额度缓存...")
+    import signal
+
+    # 标准 Unix Daemon 化：创建新会话，彻底脱离控制终端
+    try:
+        os.setsid()
+    except OSError:
+        pass  # 已是会话 leader，忽略
+
+    def _sigterm_handler(signum, frame):
+        print("守护进程收到停止信号，正在退出...")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    interval_sec = 1800
+    interval_min = interval_sec // 60
+    cycle = 0
+
+    print("=" * 60)
+    print("Codex 保活守护进程已启动")
+    print(f"  PID: {os.getpid()}")
+    print(f"  周期: 每 {interval_min} 分钟执行一轮")
+    print("  动作: 前台同步备份+额度校验 | 后台无头心跳保活")
+    print("=" * 60)
+
     try:
         while True:
+            cycle += 1
+            print("")
+            print(f">>> 第 {cycle} 轮")
             cmd_wakeup()
-            print(f"\n批量唤醒完成。等待半小时以进行下一次保活...")
-            time.sleep(1800)
-    except KeyboardInterrupt:
-        print("\n守护进程已安全退出。")
+            next_at = datetime.datetime.now() + datetime.timedelta(seconds=interval_sec)
+            next_str = next_at.strftime("%Y-%m-%d %H:%M:%S")
+            print(f"本轮结束，休眠 {interval_min} 分钟；预计下次: {next_str}")
+            time.sleep(interval_sec)
+    except (KeyboardInterrupt, SystemExit):
+        print("守护进程已安全退出。")
+
 
 def print_help():
     print(f"""
@@ -789,18 +1055,51 @@ ChatGPT/Codex 多账号管理器 CLI
   list --refresh    静默现查所有账号的限额与额度 (不打扰当前客户端，不弹窗)
   add <name>        将您当前的登录态备份另存为一个全新的 Profile 账号
   switch <name>     一键备份当前账号，无缝切换到目标账号并重新打开客户端
+  switch new        准备一个干净的“未登录”客户端环境以供登录并录入新账号
   del/remove <name> 永久删除指定账号 Profile 的本地备份和用量缓存
   wakeup            手动执行一次批量刷新保活与用量更新
   daemon            在当前终端启动常驻后台守护进程 (建议使用 wakeup_daemon.sh 启动)
 """)
 
+def _disable_ansi_colors():
+    """写入日志文件时关闭 ANSI 颜色，避免出现 [92m 这类乱码。"""
+    global GREEN, RED, YELLOW, CYAN, BOLD, RESET
+    GREEN = RED = YELLOW = CYAN = BOLD = RESET = ""
+
+
 def main():
     if len(sys.argv) < 2:
         print_help()
         sys.exit(1)
-        
+
     cmd = sys.argv[1]
-    
+
+    # 守护进程日志 / 非 TTY 输出：去掉颜色码，并给非空行加时间戳
+    if cmd in ["daemon", "wakeup"]:
+        if cmd == "daemon" or not sys.stdout.isatty():
+            _disable_ansi_colors()
+        import builtins
+        _orig_print = builtins.print
+
+        def timestamped_print(*args, **kwargs):
+            # 空行保持空行，方便分块阅读
+            if not args or (len(args) == 1 and str(args[0]).strip() == ""):
+                _orig_print(*args, **kwargs)
+                return
+            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            first_arg = str(args[0])
+            if first_arg.startswith("\n"):
+                body = first_arg[1:]
+                if body.strip() == "":
+                    _orig_print(*args, **kwargs)
+                    return
+                new_args = (f"\n[{now_str}] {body}",) + args[1:]
+            else:
+                new_args = (f"[{now_str}] {first_arg}",) + args[1:]
+            _orig_print(*new_args, **kwargs)
+
+        builtins.print = timestamped_print
+
     if cmd == "list":
         refresh = False
         if len(sys.argv) > 2 and sys.argv[2] in ["--refresh", "-r"]:
