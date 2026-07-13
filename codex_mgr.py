@@ -518,12 +518,25 @@ def cmd_del(target_profile):
 
     print(f"{GREEN}账号 '{target_profile}' 已成功删除！{RESET}")
 
-def silent_query_quota(profile_name, port=9299):
+def find_free_port():
+    """动态获取一个当前空闲可用的 TCP 端口。"""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+def silent_query_quota(profile_name):
     backup_dir = f"{BACKUP_PREFIX}_{profile_name}"
     app_support_backup = os.path.join(backup_dir, "app_support", "Default")
     
     if not os.path.exists(app_support_backup):
         return {"status": "No Backup Data"}
+        
+    # 动态分配端口，避开端口竞争与 TIME_WAIT 锁定问题
+    try:
+        port = find_free_port()
+    except Exception:
+        port = 9299 # 兜底端口
         
     # 1. 准备独立的临时 userData 目录
     temp_user_data = f"/tmp/codex_query_userdata_{profile_name}"
@@ -581,12 +594,16 @@ def silent_query_quota(profile_name, port=9299):
         # 5. 等待拉起 (增加到 4 秒以确保端口已监听就绪)
         time.sleep(4.0)
         
+        # 显式禁止代理，避免 http_proxy/https_proxy 干扰本地 127.0.0.1 的 CDP 端口通信
+        no_proxy_handler = urllib.request.ProxyHandler({})
+        opener = urllib.request.build_opener(no_proxy_handler)
+        
         # 6. 获取已有标签页，如果没有则新建一个
         list_url = f"http://127.0.0.1:{port}/json"
         req = urllib.request.Request(list_url, headers={"User-Agent": "curl/7.88.1"})
         ws_url = None
         try:
-            with urllib.request.urlopen(req, timeout=5) as response:
+            with opener.open(req, timeout=5) as response:
                 tabs = json.loads(response.read().decode('utf-8'))
                 if tabs:
                     # 优先寻找包含 chatgpt 的 tab，否则使用第一个
@@ -604,7 +621,7 @@ def silent_query_quota(profile_name, port=9299):
             new_url = f"http://127.0.0.1:{port}/json/new"
             req = urllib.request.Request(new_url, method="PUT", headers={"User-Agent": "curl/7.88.1"})
             try:
-                with urllib.request.urlopen(req, timeout=5) as response:
+                with opener.open(req, timeout=5) as response:
                     tab_data = json.loads(response.read().decode('utf-8'))
                     ws_url = tab_data.get("webSocketDebuggerUrl")
             except Exception as e:
@@ -613,8 +630,8 @@ def silent_query_quota(profile_name, port=9299):
         if not ws_url:
             return {"status": "Failed to get tab websocket url"}
             
-        # 7. 使用 WebSocket 导航并读取内容
-        ws = websocket.create_connection(ws_url, timeout=15)
+        # 7. 使用 WebSocket 导航并读取内容 (传入 skip_proxy=True 屏蔽系统代理干扰)
+        ws = websocket.create_connection(ws_url, timeout=15, skip_proxy=True)
         
         # 启用 Runtime
         send_cdp(ws, "Runtime.enable", req_id=1)
@@ -856,9 +873,13 @@ def cmd_list(refresh=False):
         elif limits_status == "No Data":
             quota_str = f"{YELLOW}No Data (请使用 --refresh 现查){RESET}"
         elif limits_status == "OK" and "rate_limit" in limits:
-            rl = limits["rate_limit"]
-            pw = rl.get("primary_window", {})
-            sw = rl.get("secondary_window", {})
+            rl = limits.get("rate_limit") or {}
+            pw = rl.get("primary_window")
+            if not isinstance(pw, dict):
+                pw = {}
+            sw = rl.get("secondary_window")
+            if not isinstance(sw, dict):
+                sw = {}
             
             # 计算剩余百分比 (剩余 = 100 - 已用)
             pct_5h = 100 - pw.get("used_percent", 0)
