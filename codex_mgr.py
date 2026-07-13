@@ -579,7 +579,10 @@ def silent_query_quota(profile_name):
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
-    def send_cdp(ws, method, params=None, req_id=1):
+    cdp_id = [0]
+    def send_cdp(ws, method, params=None):
+        cdp_id[0] += 1
+        req_id = cdp_id[0]
         payload = {"id": req_id, "method": method}
         if params:
             payload["params"] = params
@@ -633,68 +636,85 @@ def silent_query_quota(profile_name):
         # 7. 使用 WebSocket 导航并读取内容 (传入 skip_proxy=True 屏蔽系统代理干扰)
         ws = websocket.create_connection(ws_url, timeout=15, skip_proxy=True)
         
-        # 启用 Runtime
-        send_cdp(ws, "Runtime.enable", req_id=1)
+        # 启用 Runtime 并将标签页置于前台激活，防止由于 Tab 处于背景而被 Chrome 节流限制(Throttling)挂起网络
+        send_cdp(ws, "Runtime.enable")
+        send_cdp(ws, "Page.bringToFront")
         
         # 发送导航命令到 chatgpt.com。
         # 注意: 导航大页面可能耗时极长，我们通过 WebSocket 异步发送，并不阻塞等待 load 完成，以防止超时。
         ws.send(json.dumps({
-            "id": 2,
+            "id": 99999,  # 用一个特殊的较大 ID 异步发送导航命令，不占用自增 ID 轮询
             "method": "Page.navigate",
             "params": {"url": "https://chatgpt.com/"}
         }))
         
-        # 强行等待 4.5 秒，让浏览器跳转并准备好基本的 chatgpt.com 的同源 Cookie 上下文域。
-        time.sleep(4.5)
+        # 强制等待 6.0 秒以确保新页面加载定型完成，防止加载过程中产生的新页面重定向冲刷清空注入的 JS 代码与变量
+        time.sleep(6.0)
         
         # 8. 在页面上下文中 fetch backend-api/codex/usage (使用异步全局变量轮询机制)
         # 清空可能的旧数据，并把备用 Bearer Token 注入到页面全局变量
-        send_cdp(ws, "Runtime.evaluate", {"expression": "window.__my_res = null;"}, req_id=3)
+        send_cdp(ws, "Runtime.evaluate", {"expression": "window.__my_res = null;"})
         # 注入备用 token（用 JSON 序列化避免 JS 注入问题）
         token_json = json.dumps(access_token)
         send_cdp(ws, "Runtime.evaluate", {
             "expression": f"window.__bearer_token = {token_json};"
-        }, req_id=4)
+        })
         
         fetch_js = """
-        // 主要策略：用浏览器本身的 Cookie 请求（Cookie 有效期远比 access_token 长）
-        // 这样即使 auth.json 里的 access_token 已过期，只要 Session Cookie 还有效，保活就不会失败
-        fetch('https://chatgpt.com/backend-api/codex/usage', {
-            credentials: 'include'
-        }).then(r => {
-            const status = r.status;
-            return r.json().catch(() => r.text()).then(data => ({ data, status }));
-        }).then(({ data, status }) => {
-            // 若 Cookie 鉴权成功，直接返回
-            if (status !== 401) {
-                window.__my_res = data;
-                return;
-            }
-            // Cookie 鉴权返回 401，尝试用 Bearer Token 作为备用
-            const bearerToken = window.__bearer_token;
-            if (!bearerToken) {
-                window.__my_res = data;  // 没有备用 token，直接返回 401 结果
-                return;
-            }
-            return fetch('https://chatgpt.com/backend-api/codex/usage', {
-                headers: { 'Authorization': 'Bearer ' + bearerToken }
-            }).then(r2 => r2.json().catch(() => r2.text())).then(data2 => {
-                window.__my_res = data2;
+        (function() {
+            const safeParse = (r) => r.text().then(text => {
+                try { return JSON.parse(text); } catch(e) { return text; }
             });
-        }).catch(e => {
-            window.__my_res = 'FETCH_ERROR: ' + e.message;
-        })
+
+            // 主要策略：用浏览器本身的 Cookie 请求（Cookie 有效期远比 access_token 长）
+            // 这样即使 auth.json 里的 access_token 已过期，只要 Session Cookie 还有效，保活就不会失败
+            fetch('https://chatgpt.com/backend-api/codex/usage', {
+                credentials: 'include'
+            }).then(r => {
+                const status = r.status;
+                return safeParse(r).then(data => ({ data, status }));
+            }).then(({ data, status }) => {
+                // 若 Cookie 鉴权成功，直接返回
+                if (status !== 401) {
+                    window.__my_res = data;
+                    return;
+                }
+                // Cookie 鉴权返回 401，尝试用 Bearer Token 作为备用
+                const bearerToken = window.__bearer_token;
+                if (!bearerToken) {
+                    window.__my_res = data;  // 没有备用 token，直接返回 401 结果
+                    return;
+                }
+                return fetch('https://chatgpt.com/backend-api/codex/usage', {
+                    headers: { 'Authorization': 'Bearer ' + bearerToken }
+                }).then(r2 => safeParse(r2)).then(data2 => {
+                    window.__my_res = data2;
+                });
+            }).catch(e => {
+                window.__my_res = 'FETCH_ERROR: ' + e.message;
+            });
+        })();
         """
-        send_cdp(ws, "Runtime.evaluate", {"expression": fetch_js}, req_id=5)
+        eval_res = send_cdp(ws, "Runtime.evaluate", {"expression": fetch_js})
+        # 检查 JS 脚本本身是否存在语法错误或执行错误
+        if "exceptionDetails" in eval_res.get("result", {}):
+            exc = eval_res["result"]["exceptionDetails"]
+            return {"status": f"JS Evaluate Error: {exc.get('text', 'Unknown Error')} (line {exc.get('lineNumber', 0)})"}
         
-        # 轮询 12 次 (最大等待 6 秒) 获取结果
+        # 轮询 20 次 (最大等待 10 秒) 获取结果
         raw_val = None
-        for i in range(12):
+        for i in range(20):
             time.sleep(0.5)
             res = send_cdp(ws, "Runtime.evaluate", {
                 "expression": "window.__my_res",
                 "returnByValue": True
-            }, req_id=6 + i)
+            })
+            
+            # 校验轮询本身的错误
+            if "exceptionDetails" in res.get("result", {}):
+                exc = res["result"]["exceptionDetails"]
+                return {"status": f"JS Poll Error: {exc.get('text', 'Unknown Error')}"}
+                
             val = res.get("result", {}).get("result", {}).get("value")
             if val is not None:
                 raw_val = val
@@ -726,14 +746,16 @@ def silent_query_quota(profile_name):
                     limits_info["status"] = "Parse Error"
             else:
                 raw_text = str(raw_val)
-                if "challenge" in raw_text.lower() or "cloudflare" in raw_text.lower():
+                if "timeout" in raw_text.lower() or "abort" in raw_text.lower():
+                    limits_info["status"] = "Network Timeout"
+                elif "challenge" in raw_text.lower() or "cloudflare" in raw_text.lower():
                     limits_info["status"] = "Blocked by Cloudflare"
                 elif "unauthorized" in raw_text.lower() or "token is missing" in raw_text.lower() or "token_invalidated" in raw_text.lower():
                     limits_info["status"] = "Token Expired"
                 else:
                     limits_info["status"] = f"Parse Error: {raw_text[:100]}"
         else:
-            limits_info["status"] = "Empty Response"
+            limits_info["status"] = "Network Timeout"
             
     except Exception as e:
         limits_info["status"] = f"Error: {e}"
@@ -868,48 +890,49 @@ def cmd_list(refresh=False):
         quota_str = ""
         if limits_status == "Token Expired":
             quota_str = f"{RED}Token Expired ❌{RESET}"
+        elif limits_status == "Network Timeout":
+            quota_str = f"{YELLOW}Network Timeout ⚠️{RESET}"
         elif limits_status == "Blocked by Cloudflare":
             quota_str = f"{YELLOW}CF Check Failed ⚠️{RESET}"
         elif limits_status == "No Data":
             quota_str = f"{YELLOW}No Data (请使用 --refresh 现查){RESET}"
         elif limits_status == "OK" and "rate_limit" in limits:
             rl = limits.get("rate_limit") or {}
-            pw = rl.get("primary_window")
-            if not isinstance(pw, dict):
-                pw = {}
-            sw = rl.get("secondary_window")
-            if not isinstance(sw, dict):
-                sw = {}
+            parts = []
             
-            # 计算剩余百分比 (剩余 = 100 - 已用)
-            pct_5h = 100 - pw.get("used_percent", 0)
-            pct_1w = 100 - sw.get("used_percent", 0)
-            
-            # 如果剩余配额偏低，以红色警示；健康状态下以绿色呈现
-            pct_5h_str = f"{RED}{pct_5h}%{RESET}" if pct_5h <= 15 else f"{GREEN}{pct_5h}%{RESET}"
-            pct_1w_str = f"{RED}{pct_1w}%{RESET}" if pct_1w <= 15 else f"{GREEN}{pct_1w}%{RESET}"
-            
-            # 格式化 5h 的重置时间戳 (转换为本地 12小时 AM/PM 格式，如 5:52 PM)
-            r5h_str = ""
-            r5h_ts = pw.get("reset_at")
-            if r5h_ts:
-                try:
-                    dt_5h = datetime.datetime.fromtimestamp(r5h_ts)
-                    r5h_str = " " + dt_5h.strftime("%I:%M %p").lstrip('0')
-                except Exception:
-                    pass
-                    
-            # 格式化 1w 的重置时间戳 (转换为英文月日格式，如 Jul 18)
-            r1w_str = ""
-            r1w_ts = sw.get("reset_at")
-            if r1w_ts:
-                try:
-                    dt_1w = datetime.datetime.fromtimestamp(r1w_ts)
-                    r1w_str = " " + dt_1w.strftime("%b %d")
-                except Exception:
-                    pass
-                    
-            quota_str = f"5小时: {pct_5h_str}{r5h_str} | 1周: {pct_1w_str}{r1w_str}"
+            for key in ["primary_window", "secondary_window"]:
+                win = rl.get(key)
+                if not isinstance(win, dict) or not win:
+                    continue
+                
+                # 计算剩余百分比 (剩余 = 100 - 已用)
+                used_pct = win.get("used_percent", 0)
+                pct_left = 100 - used_pct
+                
+                # 如果剩余配额偏低，以红色警示；健康状态下以绿色呈现
+                pct_str = f"{RED}{pct_left}%{RESET}" if pct_left <= 15 else f"{GREEN}{pct_left}%{RESET}"
+                
+                # 重置时间
+                r_str = ""
+                r_ts = win.get("reset_at")
+                window_seconds = win.get("limit_window_seconds", 0)
+                
+                if r_ts:
+                    try:
+                        dt = datetime.datetime.fromtimestamp(r_ts)
+                        # 如果是短期窗口（小于1天），用 12 小时制显示时间 (如 5:52 PM)
+                        if window_seconds < 86400:
+                            r_str = " " + dt.strftime("%I:%M %p").lstrip('0')
+                        else:
+                            # 长期窗口（大于等于1天），用月日显示 (如 Jul 20)
+                            r_str = " " + dt.strftime("%b %d")
+                    except Exception:
+                        pass
+                
+                win_name = format_window_name(window_seconds)
+                parts.append(f"{win_name}: {pct_str}{r_str}")
+                
+            quota_str = " | ".join(parts) if parts else "OK"
         else:
             quota_str = limits_status
                 
@@ -944,6 +967,27 @@ def cmd_list(refresh=False):
         print(f"提示: 以上额度用量基于缓存展示。运行 {BOLD}python3 codex_mgr.py list --refresh{RESET} 可静默现查最新额度。")
     print(f"提示: 后台守护服务每半小时会自动保活并刷新用量缓存。")
 
+def format_window_name(seconds):
+    """根据秒数动态计算人性化的窗口长度名称。"""
+    if not seconds:
+        return "用量"
+    
+    hours = seconds / 3600
+    days = hours / 24
+    
+    if seconds == 604800:
+        return "1周"
+    if seconds == 18000:
+        return "5小时"
+    if seconds == 21600:
+        return "6小时"
+        
+    if days >= 1 and hours % 24 == 0:
+        return f"{int(days)}天"
+    if hours >= 1 and seconds % 3600 == 0:
+        return f"{int(hours)}小时"
+    return f"{seconds}秒"
+
 def _pretty_status_desc(status):
     """把接口底层的英文/异常状态翻译并附带人机友好的详细解释。"""
     if not status:
@@ -952,6 +996,8 @@ def _pretty_status_desc(status):
         return "OK"
     if status == "Token Expired":
         return "Token Expired (Session已失效/在其他设备被踢，需重新登录)"
+    if status == "Network Timeout":
+        return "Network Timeout (接口请求超时，请检查您的代理/节点速度)"
     if status == "Blocked by Cloudflare":
         return "Blocked by Cloudflare (被 OpenAI 防机器人墙拦截，请尝试切换干净的节点)"
     if status == "Empty Response":
