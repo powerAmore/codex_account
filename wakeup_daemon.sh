@@ -22,7 +22,7 @@ start_daemon() {
     #   1. stdin 重定向 /dev/null（守护进程不能读取终端输入）
     #   2. stdout/stderr 全部追加到日志文件
     #   3. disown 将其从 shell job table 中彻底移除，shell 退出时不会发 SIGHUP
-    python3 -u "${MGR_SCRIPT}" daemon < /dev/null >> "${LOG_FILE}" 2>&1 &
+    caffeinate -i python3 -u "${MGR_SCRIPT}" daemon < /dev/null >> "${LOG_FILE}" 2>&1 &
     DAEMON_PID=$!
     disown $DAEMON_PID
     

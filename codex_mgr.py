@@ -816,7 +816,7 @@ def save_usage_cache(cache):
     except Exception:
         pass
 
-def cmd_list(refresh=False):
+def cmd_list(refresh=False, target_profile=None):
     profiles = get_profiles()
     current = get_current_active()
     
@@ -824,13 +824,21 @@ def cmd_list(refresh=False):
         print(f"{YELLOW}未发现任何账号 Profile。请按照说明配置备份。{RESET}")
         return
         
+    if target_profile and target_profile not in profiles:
+        print(f"{RED}错误: 账号 Profile '{target_profile}' 不存在。{RESET}")
+        return
+        
     usage_cache = load_usage_cache()
     
     if refresh:
-        print("正在静默现查所有账号的限额与额度 (后台无头执行，不打扰当前客户端)...")
+        to_refresh = [target_profile] if target_profile else profiles
+        # 在现查开始前，如果要刷新的账号里包含当前的 ACTIVE 账号，自动增量备份其最新登录态
+        if current and current in to_refresh:
+            backup_profile(current, quiet=True)
+        print("正在静默现查指定账号的限额与额度..." if target_profile else "正在静默现查所有账号的限额与额度 (后台无头执行，不打扰当前客户端)...")
         # 对每一个 profile 现查
-        for i, p in enumerate(profiles):
-            print(f"  [{i+1}/{len(profiles)}] 正在查询账号: {p} ...", end="", flush=True)
+        for i, p in enumerate(to_refresh):
+            print(f"  [{i+1}/{len(to_refresh)}] 正在查询账号: {p} ...", end="", flush=True)
             info = silent_query_quota(p)
             usage_cache[p] = {
                 "limits": info,
@@ -855,6 +863,8 @@ def cmd_list(refresh=False):
     print("-" * 135)
     
     for p in profiles:
+        if target_profile and p != target_profile:
+            continue
         backup_dir = f"{BACKUP_PREFIX}_{p}"
         auth_path = os.path.join(backup_dir, "auth.json")
         
@@ -1234,9 +1244,13 @@ def main():
 
     if cmd == "list":
         refresh = False
-        if len(sys.argv) > 2 and sys.argv[2] in ["--refresh", "-r"]:
-            refresh = True
-        cmd_list(refresh)
+        target_profile = None
+        for arg in sys.argv[2:]:
+            if arg in ["--refresh", "-r"]:
+                refresh = True
+            else:
+                target_profile = arg
+        cmd_list(refresh, target_profile)
     elif cmd == "add":
         profile = sys.argv[2] if len(sys.argv) > 2 else None
         cmd_add(profile)
