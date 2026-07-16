@@ -3,8 +3,12 @@ import os
 import sys
 import json
 import base64
+import contextlib
+import fcntl
 import shutil
+import signal
 import subprocess
+import tempfile
 import time
 import datetime
 import urllib.request
@@ -32,6 +36,18 @@ ACTIVE_FILE = os.path.expanduser("~/Library/Application Support/.active_codex_pr
 CODEX_HOME = os.path.expanduser("~/.codex")
 AUTH_FILE = os.path.join(CODEX_HOME, "auth.json")
 USAGE_CACHE_FILE = os.path.join(CODEX_HOME, "accounts_usage.json")
+OPERATION_LOCK_FILE = os.path.join(CODEX_HOME, "codex_mgr_operation.lock")
+DAEMON_LOCK_FILE = os.path.join(CODEX_HOME, "codex_mgr_daemon.lock")
+DAEMON_PID_FILE = os.path.join(CODEX_HOME, "codex_mgr_daemon.pid")
+CAFFEINATE_PID_FILE = os.path.join(CODEX_HOME, "codex_mgr_caffeinate.pid")
+CODEX_CLI_PATH = "/Applications/ChatGPT.app/Contents/Resources/codex"
+
+_DAEMON_LOCK_FD = None
+
+# 本机使用 TUN 时，流量已经在网络层接管；再次读取 HTTP(S)_PROXY 会形成
+# 应用层二次代理。需要传统 HTTP/SOCKS 代理时可显式设置为 env。
+NETWORK_MODE_ENV = "CODEX_MGR_NETWORK_MODE"
+DEFAULT_NETWORK_MODE = "tun"
 
 # 颜色控制
 GREEN = '\033[92m'
@@ -40,6 +56,68 @@ YELLOW = '\033[93m'
 CYAN = '\033[96m'
 BOLD = '\033[1m'
 RESET = '\033[0m'
+
+
+def get_network_mode():
+    """返回网络模式：tun 忽略应用层代理；env 显式使用 HTTP(S)_PROXY。"""
+    mode = os.environ.get(NETWORK_MODE_ENV, DEFAULT_NETWORK_MODE).strip().lower()
+    if mode not in ("tun", "env"):
+        return DEFAULT_NETWORK_MODE
+    return mode
+
+
+def _url_opener_for_network_mode():
+    if get_network_mode() == "env":
+        return urllib.request.build_opener()
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _browser_proxy_args():
+    """TUN 由系统路由接管；env 模式才让 Chromium 读取系统/环境代理。"""
+    if get_network_mode() == "env":
+        return []
+    return ["--no-proxy-server"]
+
+
+@contextlib.contextmanager
+def operation_lock(timeout=60):
+    """跨进程串行化 switch/refresh/wakeup，防止 Profile 与缓存相互覆盖。"""
+    os.makedirs(CODEX_HOME, exist_ok=True)
+    lock_file = open(OPERATION_LOCK_FILE, "a+")
+    deadline = time.monotonic() + max(0, timeout)
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.2)
+        yield acquired
+    finally:
+        if acquired:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def _atomic_write_text(path, text, mode=0o600):
+    """同目录临时文件 + fsync + replace，避免崩溃留下半截文件。"""
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", dir=parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w") as temp_file:
+            temp_file.write(text)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 def get_current_active():
     if os.path.exists(ACTIVE_FILE):
@@ -52,8 +130,7 @@ def get_current_active():
 
 def set_current_active(name):
     try:
-        with open(ACTIVE_FILE, 'w') as f:
-            f.write(name)
+        _atomic_write_text(ACTIVE_FILE, name, mode=0o600)
     except Exception as e:
         print(f"[{RED}ERROR{RESET}] 无法写入活跃配置文件: {e}")
 
@@ -110,6 +187,73 @@ def kill_chatgpt_processes():
             subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
         time.sleep(1.0)
 
+
+def _atomic_copy_file(src, dst, mode=None):
+    parent = os.path.dirname(dst)
+    os.makedirs(parent, exist_ok=True)
+    fd, staging = tempfile.mkstemp(prefix=f".{os.path.basename(dst)}.", dir=parent)
+    os.close(fd)
+    try:
+        shutil.copy2(src, staging)
+        if mode is not None:
+            os.chmod(staging, mode)
+        os.replace(staging, dst)
+    finally:
+        if os.path.exists(staging):
+            os.unlink(staging)
+
+
+def _snapshot_sqlite_database(src, dst):
+    """使用 SQLite backup API 获取运行中数据库的一致快照。"""
+    import sqlite3
+
+    parent = os.path.dirname(dst)
+    os.makedirs(parent, exist_ok=True)
+    fd, staging = tempfile.mkstemp(prefix=f".{os.path.basename(dst)}.", dir=parent)
+    os.close(fd)
+    try:
+        source = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=5)
+        target = sqlite3.connect(staging)
+        source.backup(target)
+        target.close()
+        source.close()
+        check = sqlite3.connect(f"file:{staging}?mode=ro", uri=True)
+        integrity = check.execute("PRAGMA quick_check").fetchone()[0]
+        check.close()
+        if integrity != "ok":
+            raise RuntimeError(f"SQLite snapshot integrity check failed: {integrity}")
+        os.chmod(staging, 0o600)
+        os.replace(staging, dst)
+    finally:
+        if os.path.exists(staging):
+            os.unlink(staging)
+
+
+def _replace_directory_copy(src, dst):
+    """完整复制成功后再切换目录，并保留失败回滚路径。"""
+    parent = os.path.dirname(dst)
+    os.makedirs(parent, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=f".{os.path.basename(dst)}.staging.", dir=parent)
+    previous = dst + ".previous"
+    moved_old = False
+    try:
+        shutil.copytree(src, staging, dirs_exist_ok=True)
+        if os.path.exists(previous):
+            shutil.rmtree(previous)
+        if os.path.exists(dst):
+            os.replace(dst, previous)
+            moved_old = True
+        os.replace(staging, dst)
+        staging = None
+    except Exception:
+        if moved_old and not os.path.exists(dst) and os.path.exists(previous):
+            os.replace(previous, dst)
+        raise
+    finally:
+        if staging and os.path.exists(staging):
+            shutil.rmtree(staging, ignore_errors=True)
+
+
 def backup_profile(profile_name, quiet=False):
     """将当前登录态备份到指定 Profile 目录。返回 True 表示成功，False 表示失败。"""
     backup_dir = f"{BACKUP_PREFIX}_{profile_name}"
@@ -130,35 +274,38 @@ def backup_profile(profile_name, quiet=False):
     if os.path.exists(default_dir):
         if not quiet:
             print(f"正在增量备份活跃账号 Cookies & 本地存储...")
-        # 仅备份核心认证文件以极大地压缩体积
-        for item in ["Cookies", "Cookies-journal"]:
-            src = os.path.join(default_dir, item)
-            if os.path.exists(src):
-                try:
-                    shutil.copy2(src, os.path.join(app_support_backup, item))
-                except Exception as e:
-                    if not quiet:
-                        print(f"[{RED}ERROR{RESET}] 备份 {item} 失败: {e}")
-                    success = False
+        # Cookies 是运行中的 SQLite：使用在线 backup API，禁止直接复制半写入文件。
+        cookies_src = os.path.join(default_dir, "Cookies")
+        if os.path.exists(cookies_src):
+            try:
+                _snapshot_sqlite_database(
+                    cookies_src,
+                    os.path.join(app_support_backup, "Cookies"),
+                )
+                stale_journal = os.path.join(app_support_backup, "Cookies-journal")
+                if os.path.exists(stale_journal):
+                    os.remove(stale_journal)
+            except Exception as e:
+                if not quiet:
+                    print(f"[{RED}ERROR{RESET}] Cookies 一致性快照失败: {e}")
+                success = False
 
-        # 复制 Local Storage / Session Storage
-        for folder in ["Local Storage", "Session Storage"]:
-            src_folder = os.path.join(default_dir, folder)
-            dst_folder = os.path.join(app_support_backup, folder)
-            if os.path.exists(src_folder):
-                try:
-                    if os.path.exists(dst_folder):
-                        shutil.rmtree(dst_folder)
-                    shutil.copytree(src_folder, dst_folder)
-                except Exception as e:
-                    if not quiet:
+        # quiet=True 表示 App 正在运行的守护同步；避免复制正在写入的 LevelDB。
+        if not quiet:
+            for folder in ["Local Storage", "Session Storage"]:
+                src_folder = os.path.join(default_dir, folder)
+                dst_folder = os.path.join(app_support_backup, folder)
+                if os.path.exists(src_folder):
+                    try:
+                        _replace_directory_copy(src_folder, dst_folder)
+                    except Exception as e:
                         print(f"[{RED}ERROR{RESET}] 备份 '{folder}' 失败: {e}")
-                    success = False
+                        success = False
 
     # 备份 auth.json
     if os.path.exists(AUTH_FILE):
         try:
-            shutil.copy2(AUTH_FILE, os.path.join(backup_dir, "auth.json"))
+            _atomic_copy_file(AUTH_FILE, os.path.join(backup_dir, "auth.json"), mode=0o600)
         except Exception as e:
             if not quiet:
                 print(f"[{RED}ERROR{RESET}] 备份 auth.json 失败: {e}")
@@ -184,7 +331,7 @@ def restore_profile(profile_name):
             src = os.path.join(app_support_backup, item)
             dst = os.path.join(default_dir, item)
             if os.path.exists(src):
-                shutil.copy2(src, dst)
+                _atomic_copy_file(src, dst, mode=0o600)
             elif os.path.exists(dst):
                 try:
                     os.remove(dst)
@@ -196,15 +343,13 @@ def restore_profile(profile_name):
             src_folder = os.path.join(app_support_backup, folder)
             dst_folder = os.path.join(default_dir, folder)
             if os.path.exists(src_folder):
-                if os.path.exists(dst_folder):
-                    shutil.rmtree(dst_folder)
-                shutil.copytree(src_folder, dst_folder)
+                _replace_directory_copy(src_folder, dst_folder)
                 
     # 还原 auth.json
     backup_auth = os.path.join(backup_dir, "auth.json")
     if os.path.exists(backup_auth):
         os.makedirs(CODEX_HOME, exist_ok=True)
-        shutil.copy2(backup_auth, AUTH_FILE)
+        _atomic_copy_file(backup_auth, AUTH_FILE, mode=0o600)
     elif os.path.exists(AUTH_FILE):
         try:
             os.remove(AUTH_FILE)
@@ -525,279 +670,530 @@ def find_free_port():
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
-def silent_query_quota(profile_name):
-    backup_dir = f"{BACKUP_PREFIX}_{profile_name}"
-    app_support_backup = os.path.join(backup_dir, "app_support", "Default")
-    
-    if not os.path.exists(app_support_backup):
-        return {"status": "No Backup Data"}
-        
-    # 动态分配端口，避开端口竞争与 TIME_WAIT 锁定问题
-    try:
-        port = find_free_port()
-    except Exception:
-        port = 9299 # 兜底端口
-        
-    # 1. 准备独立的临时 userData 目录
-    temp_user_data = f"/tmp/codex_query_userdata_{profile_name}"
-    if os.path.exists(temp_user_data):
-        shutil.rmtree(temp_user_data)
-    os.makedirs(os.path.join(temp_user_data, "Default"), exist_ok=True)
-    
-    # 2. 把 Cookies & LocalStorage 复制过去
+def _copy_browser_state(src_default, dst_default, replace=False):
+    """复制查询所需的最小浏览器状态；仅在浏览器进程停止后调用。"""
+    os.makedirs(dst_default, exist_ok=True)
     for item in ["Cookies", "Cookies-journal"]:
-        src = os.path.join(app_support_backup, item)
+        src = os.path.join(src_default, item)
         if os.path.exists(src):
-            shutil.copy2(src, os.path.join(temp_user_data, "Default", item))
-            
+            shutil.copy2(src, os.path.join(dst_default, item))
+
     for folder in ["Local Storage", "Session Storage"]:
-        src_folder = os.path.join(app_support_backup, folder)
-        if os.path.exists(src_folder):
-            shutil.copytree(src_folder, os.path.join(temp_user_data, "Default", folder))
-            
-    # 3. 读取 auth.json 里的 access_token（仅作为备用，主要依赖 Cookie 鉴权）
-    access_token = ""
-    auth_path = os.path.join(backup_dir, "auth.json")
-    if os.path.exists(auth_path):
-        try:
-            with open(auth_path, "r") as f:
-                auth_data = json.load(f)
-                access_token = auth_data.get("tokens", {}).get("access_token", "")
-        except Exception:
-            pass
+        src_folder = os.path.join(src_default, folder)
+        dst_folder = os.path.join(dst_default, folder)
+        if not os.path.exists(src_folder):
+            continue
+        if replace and os.path.exists(dst_folder):
+            shutil.rmtree(dst_folder)
+        if not os.path.exists(dst_folder):
+            shutil.copytree(src_folder, dst_folder)
 
-    # 4. headless 模式拉起独立进程 (使用绕过 Cloudflare 检测的参数)
-    cmd = [
-        "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
-        f"--user-data-dir={temp_user_data}",
-        f"--remote-debugging-port={port}",
-        "--remote-allow-origins=*",
-        "--disable-blink-features=AutomationControlled",
-        "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 ChatGPT/1.0.0",
-        "--blink-settings=imagesEnabled=false",
-        "--headless"
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
-    cdp_id = [0]
-    def send_cdp(ws, method, params=None):
-        cdp_id[0] += 1
-        req_id = cdp_id[0]
-        payload = {"id": req_id, "method": method}
-        if params:
-            payload["params"] = params
-        ws.send(json.dumps(payload))
-        while True:
-            res_frame = json.loads(ws.recv())
-            if res_frame.get("id") == req_id:
-                return res_frame
-                
-    limits_info = {}
+
+def _validate_cookie_db(default_dir):
+    """确认待提升的 Cookie 数据库完整且仍包含 ChatGPT/OpenAI Cookie。"""
+    import sqlite3
+
+    cookie_path = os.path.join(default_dir, "Cookies")
+    if not os.path.exists(cookie_path) or os.path.getsize(cookie_path) == 0:
+        return False
     try:
-        # 5. 等待拉起 (增加到 4 秒以确保端口已监听就绪)
-        time.sleep(4.0)
-        
-        # 显式禁止代理，避免 http_proxy/https_proxy 干扰本地 127.0.0.1 的 CDP 端口通信
-        no_proxy_handler = urllib.request.ProxyHandler({})
-        opener = urllib.request.build_opener(no_proxy_handler)
-        
-        # 6. 获取已有标签页，如果没有则新建一个
-        list_url = f"http://127.0.0.1:{port}/json"
-        req = urllib.request.Request(list_url, headers={"User-Agent": "curl/7.88.1"})
-        ws_url = None
-        try:
-            with opener.open(req, timeout=5) as response:
-                tabs = json.loads(response.read().decode('utf-8'))
-                if tabs:
-                    # 优先寻找包含 chatgpt 的 tab，否则使用第一个
-                    for t in tabs:
-                        if "chatgpt.com" in t.get("url", ""):
-                            ws_url = t.get("webSocketDebuggerUrl")
-                            break
-                    if not ws_url:
-                        ws_url = tabs[0].get("webSocketDebuggerUrl")
-        except Exception:
-            pass
-            
-        if not ws_url:
-            # 如果没有，则发送 PUT 新建标签页
-            new_url = f"http://127.0.0.1:{port}/json/new"
-            req = urllib.request.Request(new_url, method="PUT", headers={"User-Agent": "curl/7.88.1"})
-            try:
-                with opener.open(req, timeout=5) as response:
-                    tab_data = json.loads(response.read().decode('utf-8'))
-                    ws_url = tab_data.get("webSocketDebuggerUrl")
-            except Exception as e:
-                return {"status": f"CDP Connection Failed: {e}"}
-                
-        if not ws_url:
-            return {"status": "Failed to get tab websocket url"}
-            
-        # 7. 使用 WebSocket 导航并读取内容 (传入 skip_proxy=True 屏蔽系统代理干扰)
-        ws = websocket.create_connection(ws_url, timeout=15, skip_proxy=True)
-        
-        # 启用 Runtime 并将标签页置于前台激活，防止由于 Tab 处于背景而被 Chrome 节流限制(Throttling)挂起网络
-        send_cdp(ws, "Runtime.enable")
-        send_cdp(ws, "Page.bringToFront")
-        
-        # 发送导航命令到 chatgpt.com。
-        # 注意: 导航大页面可能耗时极长，我们通过 WebSocket 异步发送，并不阻塞等待 load 完成，以防止超时。
-        ws.send(json.dumps({
-            "id": 99999,  # 用一个特殊的较大 ID 异步发送导航命令，不占用自增 ID 轮询
-            "method": "Page.navigate",
-            "params": {"url": "https://chatgpt.com/"}
-        }))
-        
-        # 强制等待 6.0 秒以确保新页面加载定型完成，防止加载过程中产生的新页面重定向冲刷清空注入的 JS 代码与变量
-        time.sleep(6.0)
-        
-        # 8. 在页面上下文中 fetch backend-api/codex/usage (使用异步全局变量轮询机制)
-        # 清空可能的旧数据，并把备用 Bearer Token 注入到页面全局变量
-        send_cdp(ws, "Runtime.evaluate", {"expression": "window.__my_res = null;"})
-        # 注入备用 token（用 JSON 序列化避免 JS 注入问题）
-        token_json = json.dumps(access_token)
-        send_cdp(ws, "Runtime.evaluate", {
-            "expression": f"window.__bearer_token = {token_json};"
-        })
-        
-        fetch_js = """
-        (function() {
-            const safeParse = (r) => r.text().then(text => {
-                try { return JSON.parse(text); } catch(e) { return text; }
-            });
+        connection = sqlite3.connect(f"file:{cookie_path}?mode=ro", uri=True)
+        integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
+        relevant_count = connection.execute(
+            "SELECT COUNT(*) FROM cookies "
+            "WHERE host_key LIKE '%chatgpt%' OR host_key LIKE '%openai%'"
+        ).fetchone()[0]
+        connection.close()
+        return integrity == "ok" and relevant_count > 0
+    except Exception:
+        return False
 
-            // 主要策略：用浏览器本身的 Cookie 请求（Cookie 有效期远比 access_token 长）
-            // 这样即使 auth.json 里的 access_token 已过期，只要 Session Cookie 还有效，保活就不会失败
-            fetch('https://chatgpt.com/backend-api/codex/usage', {
-                credentials: 'include'
-            }).then(r => {
-                const status = r.status;
-                return safeParse(r).then(data => ({ data, status }));
-            }).then(({ data, status }) => {
-                // 若 Cookie 鉴权成功，直接返回
-                if (status !== 401) {
-                    window.__my_res = data;
-                    return;
-                }
-                // Cookie 鉴权返回 401，尝试用 Bearer Token 作为备用
-                const bearerToken = window.__bearer_token;
-                if (!bearerToken) {
-                    window.__my_res = data;  // 没有备用 token，直接返回 401 结果
-                    return;
-                }
-                return fetch('https://chatgpt.com/backend-api/codex/usage', {
-                    headers: { 'Authorization': 'Bearer ' + bearerToken }
-                }).then(r2 => safeParse(r2)).then(data2 => {
-                    window.__my_res = data2;
-                });
-            }).catch(e => {
-                window.__my_res = 'FETCH_ERROR: ' + e.message;
-            });
-        })();
-        """
-        eval_res = send_cdp(ws, "Runtime.evaluate", {"expression": fetch_js})
-        # 检查 JS 脚本本身是否存在语法错误或执行错误
-        if "exceptionDetails" in eval_res.get("result", {}):
-            exc = eval_res["result"]["exceptionDetails"]
-            return {"status": f"JS Evaluate Error: {exc.get('text', 'Unknown Error')} (line {exc.get('lineNumber', 0)})"}
-        
-        # 轮询 20 次 (最大等待 10 秒) 获取结果
-        raw_val = None
-        for i in range(20):
-            time.sleep(0.5)
-            res = send_cdp(ws, "Runtime.evaluate", {
-                "expression": "window.__my_res",
-                "returnByValue": True
-            })
-            
-            # 校验轮询本身的错误
-            if "exceptionDetails" in res.get("result", {}):
-                exc = res["result"]["exceptionDetails"]
-                return {"status": f"JS Poll Error: {exc.get('text', 'Unknown Error')}"}
-                
-            val = res.get("result", {}).get("result", {}).get("value")
-            if val is not None:
-                raw_val = val
-                break
-                
-        ws.close()
-        
-        # 9. 解析获取的数据
-        if raw_val:
-            if isinstance(raw_val, dict):
-                if "rate_limit" in raw_val:
-                    limits_info["rate_limit"] = raw_val["rate_limit"]
-                    limits_info["status"] = "OK"
-                elif "error" in raw_val:
-                    # OpenAI 标准错误格式: {"error": {"code": "token_invalidated", ...}, "status": 401}
-                    error_obj = raw_val.get("error", {})
-                    error_code = str(error_obj.get("code", "")).lower()
-                    http_status = raw_val.get("status", 0)
-                    if http_status == 401 or "token" in error_code or "invalid" in error_code or "unauthorized" in error_code:
-                        limits_info["status"] = "Token Expired"
-                    else:
-                        limits_info["status"] = f"API Error: {error_obj.get('message', str(raw_val))}"
-                elif "detail" in raw_val:
-                    if "unauthorized" in str(raw_val).lower():
-                        limits_info["status"] = "Token Expired"
-                    else:
-                        limits_info["status"] = f"API Error: {raw_val.get('detail')}"
-                else:
-                    limits_info["status"] = "Parse Error"
-            else:
-                raw_text = str(raw_val)
-                if "timeout" in raw_text.lower() or "abort" in raw_text.lower():
-                    limits_info["status"] = "Network Timeout"
-                elif "challenge" in raw_text.lower() or "cloudflare" in raw_text.lower():
-                    limits_info["status"] = "Blocked by Cloudflare"
-                elif "unauthorized" in raw_text.lower() or "token is missing" in raw_text.lower() or "token_invalidated" in raw_text.lower():
-                    limits_info["status"] = "Token Expired"
-                else:
-                    limits_info["status"] = f"Parse Error: {raw_text[:100]}"
-        else:
-            limits_info["status"] = "Network Timeout"
-            
-    except Exception as e:
-        limits_info["status"] = f"Error: {e}"
+
+def _promote_browser_state(temp_default, backup_default):
+    """经认证的浏览器状态才以两阶段目录切换提升，并保留上一代可回滚副本。"""
+    parent = os.path.dirname(backup_default)
+    os.makedirs(parent, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=".Default.staging.", dir=parent)
+    previous = backup_default + ".previous"
+    moved_old = False
+    try:
+        _copy_browser_state(temp_default, staging)
+        if not _validate_cookie_db(staging):
+            raise RuntimeError("Cookie snapshot validation failed")
+
+        if os.path.exists(previous):
+            shutil.rmtree(previous)
+        if os.path.exists(backup_default):
+            os.replace(backup_default, previous)
+            moved_old = True
+        os.replace(staging, backup_default)
+        staging = None
+        return True
+    except Exception:
+        if moved_old and not os.path.exists(backup_default) and os.path.exists(previous):
+            os.replace(previous, backup_default)
+        return False
     finally:
-        # 10. 彻底清理无头进程
-        proc.terminate()
+        if staging and os.path.exists(staging):
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _terminate_browser_tree(proc, temp_user_data):
+    """结束整个查询进程组，并清理会脱离父进程的 crashpad 辅助进程。"""
+    if proc is not None:
         try:
-            proc.wait(timeout=2)
-        except Exception:
-            proc.kill()
-
-        # 11. 把无头实例运行后可能更新的 Cookies / LocalStorage 拷回备份目录
-        #     （服务器可能下发了新的滚动 Session Cookie，不拷回则下次唤醒用的是旧 Cookie）
-        try:
-            tmp_default = os.path.join(temp_user_data, "Default")
-            backup_default = os.path.join(backup_dir, "app_support", "Default")
-            os.makedirs(backup_default, exist_ok=True)
-
-            for item in ["Cookies", "Cookies-journal"]:
-                src = os.path.join(tmp_default, item)
-                dst = os.path.join(backup_default, item)
-                if os.path.exists(src):
-                    shutil.copy2(src, dst)
-
-            for folder in ["Local Storage", "Session Storage"]:
-                src_folder = os.path.join(tmp_default, folder)
-                dst_folder = os.path.join(backup_default, folder)
-                if os.path.exists(src_folder):
-                    if os.path.exists(dst_folder):
-                        shutil.rmtree(dst_folder)
-                    shutil.copytree(src_folder, dst_folder)
-        except Exception as e:
-            # 拷回失败不影响主流程，仅记录
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
             pass
-
-        # 12. 清理临时 userData
         try:
-            shutil.rmtree(temp_user_data)
+            proc.wait(timeout=3)
         except Exception:
-            pass
-            
-    return limits_info
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    # Chromium crashpad 可能双重 fork 后变成 PPID=1；唯一临时目录可安全限定清理范围。
+    try:
+        match = subprocess.run(
+            ["pgrep", "-f", temp_user_data],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        helper_pids = [int(value) for value in match.stdout.split() if value.isdigit()]
+        for helper_pid in helper_pids:
+            if helper_pid != os.getpid():
+                try:
+                    os.kill(helper_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        if helper_pids:
+            time.sleep(0.15)
+        for helper_pid in helper_pids:
+            if helper_pid != os.getpid():
+                try:
+                    os.kill(helper_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+    except Exception:
+        pass
+
+
+def _cdp_request(ws, request_state, method, params=None, timeout=10):
+    """发送一个 CDP 请求并只等待自己的响应，事件消息会被安全忽略。"""
+    request_state[0] += 1
+    req_id = request_state[0]
+    payload = {"id": req_id, "method": method}
+    if params is not None:
+        payload["params"] = params
+    ws.send(json.dumps(payload))
+
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"CDP Timeout: {method}")
+        ws.settimeout(remaining)
+        frame = ws.recv()
+        if not frame:
+            raise RuntimeError(f"CDP Connection Closed: {method}")
+        response = json.loads(frame)
+        if response.get("id") != req_id:
+            continue
+        if response.get("error"):
+            error = response["error"]
+            raise RuntimeError(f"CDP Error: {method}: {error.get('message', error)}")
+        return response
+
+
+def _wait_for_cdp_page(opener, port, proc, timeout=15):
+    """轮询调试端口直至真正可用，避免固定 sleep 带来的启动竞争。"""
+    deadline = time.monotonic() + timeout
+    last_error = "debugger endpoint not ready"
+    created_page = False
+
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"Browser Exited Early: code {proc.returncode}")
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/json",
+                headers={"User-Agent": "codex_mgr/1.0"},
+            )
+            with opener.open(req, timeout=1) as response:
+                targets = json.loads(response.read().decode("utf-8"))
+
+            pages = [
+                target for target in targets
+                if target.get("type") == "page" and target.get("webSocketDebuggerUrl")
+            ]
+            if pages:
+                preferred = next(
+                    (page for page in pages if "chatgpt.com" in page.get("url", "")),
+                    pages[0],
+                )
+                return preferred["webSocketDebuggerUrl"]
+
+            if not created_page:
+                new_req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/json/new",
+                    method="PUT",
+                    headers={"User-Agent": "codex_mgr/1.0"},
+                )
+                with opener.open(new_req, timeout=1) as response:
+                    page = json.loads(response.read().decode("utf-8"))
+                created_page = True
+                if page.get("webSocketDebuggerUrl"):
+                    return page["webSocketDebuggerUrl"]
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(0.25)
+
+    raise TimeoutError(f"Browser Startup Timeout: {last_error}")
+
+
+def _wait_for_chatgpt_page(ws, request_state, timeout=25):
+    """等待导航与重定向稳定，避免在旧 execution context 中注入 fetch。"""
+    deadline = time.monotonic() + timeout
+    stable_checks = 0
+    last_href = ""
+
+    while time.monotonic() < deadline:
+        remaining = max(0.5, min(5, deadline - time.monotonic()))
+        try:
+            response = _cdp_request(
+                ws,
+                request_state,
+                "Runtime.evaluate",
+                {
+                    "expression": "({href: location.href, origin: location.origin, readyState: document.readyState})",
+                    "returnByValue": True,
+                },
+                timeout=remaining,
+            )
+            result = response.get("result", {})
+            if result.get("exceptionDetails"):
+                stable_checks = 0
+            else:
+                value = result.get("result", {}).get("value") or {}
+                href = str(value.get("href", ""))
+                ready_state = value.get("readyState")
+                is_ready = (
+                    value.get("origin") == "https://chatgpt.com"
+                    and ready_state in ("interactive", "complete")
+                )
+                if is_ready and href == last_href:
+                    stable_checks += 1
+                    if stable_checks >= 2:
+                        return
+                else:
+                    stable_checks = 1 if is_ready else 0
+                last_href = href
+        except (TimeoutError, RuntimeError, ValueError, json.JSONDecodeError):
+            # 导航过程中 execution context 被销毁是正常瞬态，继续等新页面。
+            stable_checks = 0
+        time.sleep(0.4)
+
+    raise TimeoutError(f"Page Load Timeout: last URL {last_href or 'unknown'}")
+
+
+def _parse_quota_fetch_result(fetch_result):
+    """把带 HTTP 状态的浏览器 fetch 结果转换成稳定、可区分的状态。"""
+    if not isinstance(fetch_result, dict):
+        return {"status": f"Parse Error: {str(fetch_result)[:100]}"}
+
+    if fetch_result.get("kind") == "fetch_error":
+        error_name = str(fetch_result.get("name", ""))
+        message = str(fetch_result.get("message", "Unknown fetch error"))
+        if error_name == "AbortError" or "abort" in message.lower():
+            return {"status": "Fetch Timeout"}
+        return {"status": f"Network Error: {message}"}
+
+    if fetch_result.get("kind") != "http":
+        return {"status": f"Parse Error: {str(fetch_result)[:100]}"}
+
+    http_status = int(fetch_result.get("status") or 0)
+    body = fetch_result.get("body")
+    body_text = str(body).lower()
+
+    if http_status == 401:
+        return {"status": "Token Expired"}
+    if http_status == 403:
+        return {"status": "Blocked by Cloudflare"}
+
+    if isinstance(body, dict):
+        if "rate_limit" in body:
+            result = {"status": "OK", "rate_limit": body["rate_limit"]}
+            for identity_key in ("account_id", "email", "user_id"):
+                if body.get(identity_key):
+                    result[identity_key] = body[identity_key]
+            return result
+        if "error" in body:
+            error_obj = body.get("error")
+            if isinstance(error_obj, dict):
+                error_code = str(error_obj.get("code", "")).lower()
+                error_message = error_obj.get("message", str(error_obj))
+            else:
+                error_code = str(error_obj).lower()
+                error_message = str(error_obj)
+            if any(word in error_code for word in ("token", "invalid", "unauthorized")):
+                return {"status": "Token Expired"}
+            return {"status": f"API Error: HTTP {http_status}: {error_message}"}
+        if "detail" in body:
+            if "unauthorized" in body_text:
+                return {"status": "Token Expired"}
+            return {"status": f"API Error: HTTP {http_status}: {body.get('detail')}"}
+
+    if http_status >= 400:
+        return {"status": f"API Error: HTTP {http_status}: {str(body)[:100]}"}
+    if "challenge" in body_text or "cloudflare" in body_text:
+        return {"status": "Blocked by Cloudflare"}
+    if any(word in body_text for word in ("unauthorized", "token is missing", "token_invalidated")):
+        return {"status": "Token Expired"}
+    return {"status": f"Parse Error: HTTP {http_status}: {str(body)[:100]}"}
+
+
+def _query_quota_with_token(access_token, timeout=15):
+    """用未过期的 Bearer Token 直查额度，绕开页面 Service Worker/重定向。"""
+    if not access_token:
+        return {"status": "No Access Token"}
+
+    request = urllib.request.Request(
+        "https://chatgpt.com/backend-api/codex/usage",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": "codex_mgr/1.0",
+        },
+    )
+    try:
+        opener = _url_opener_for_network_mode()
+        with opener.open(request, timeout=timeout) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+            try:
+                body = json.loads(raw_body)
+            except json.JSONDecodeError:
+                body = raw_body
+            result = _parse_quota_fetch_result(
+                {"kind": "http", "status": response.status, "body": body}
+            )
+    except urllib.error.HTTPError as exc:
+        raw_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError:
+            body = raw_body
+        result = _parse_quota_fetch_result(
+            {"kind": "http", "status": exc.code, "body": body}
+        )
+    except (TimeoutError, OSError) as exc:
+        if "timed out" in str(exc).lower():
+            result = {"status": "Fetch Timeout"}
+        else:
+            result = {"status": f"Network Error: {exc}"}
+    except Exception as exc:
+        result = {"status": f"Network Error: {type(exc).__name__}: {exc}"}
+
+    result["source"] = "bearer"
+    return result
+
+
+def _validate_heartbeat_identity(heartbeat, expected_account_id, expected_email):
+    """Cookie 心跳必须返回同一账号身份，防止跨 Profile 状态串号。"""
+    actual_account_id = str(heartbeat.get("account_id") or "")
+    actual_email = str(heartbeat.get("email") or "").lower()
+    expected_account_id = str(expected_account_id or "")
+    expected_email = str(expected_email or "").lower()
+
+    if expected_account_id:
+        if not actual_account_id:
+            return False, "Cookie Identity Missing: account_id"
+        if actual_account_id != expected_account_id:
+            return False, "Cookie Identity Mismatch: account_id"
+    if expected_email:
+        if not actual_email:
+            return False, "Cookie Identity Missing: email"
+        if actual_email != expected_email:
+            return False, "Cookie Identity Mismatch: email"
+    return True, "OK"
+
+
+def _oauth_probe_environment(temp_home):
+    env = os.environ.copy()
+    env["CODEX_HOME"] = temp_home
+    if get_network_mode() == "tun":
+        for key in (
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+            "http_proxy", "https_proxy", "all_proxy",
+        ):
+            env.pop(key, None)
+    return env
+
+
+def _probe_codex_oauth(profile_name, timeout=35):
+    """用官方 Codex 认证 WebSocket 验证/按需续签后台 Profile。"""
+    backup_dir = f"{BACKUP_PREFIX}_{profile_name}"
+    auth_path = os.path.join(backup_dir, "auth.json")
+    if not os.path.exists(auth_path):
+        return {"status": "No Auth Data", "source": "codex-doctor"}
+    if not os.path.exists(CODEX_CLI_PATH):
+        return {"status": "Codex CLI Missing", "source": "codex-doctor"}
+
+    temp_home = tempfile.mkdtemp(prefix="codex_oauth_probe_")
+    temp_auth = os.path.join(temp_home, "auth.json")
+    try:
+        _atomic_copy_file(auth_path, temp_auth, mode=0o600)
+        with open(auth_path, "r") as auth_file:
+            original = json.load(auth_file)
+        original_account = str((original.get("tokens") or {}).get("account_id") or "")
+
+        completed = subprocess.run(
+            [CODEX_CLI_PATH, "doctor", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=_oauth_probe_environment(temp_home),
+        )
+        # doctor 的总体退出码可能被更新检查等无关项拉成非零；这里仅依据
+        # auth.credentials 与 authenticated WebSocket 两项做认证判断。
+        try:
+            report = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            detail = (completed.stderr or completed.stdout or "unknown error").strip()
+            detail = " ".join(detail.splitlines())
+            return {
+                "status": f"OAuth Probe Error: {detail[:160]}",
+                "source": "codex-doctor",
+            }
+        checks = report.get("checks") or {}
+        credentials = checks.get("auth.credentials") or {}
+        websocket_check = checks.get("network.websocket_reachability") or {}
+        if credentials.get("status") != "ok":
+            detail = credentials.get("summary") or "credentials check failed"
+            return {"status": f"OAuth Credentials Error: {detail}", "source": "codex-doctor"}
+        if websocket_check.get("status") != "ok":
+            detail = websocket_check.get("summary") or "authenticated websocket failed"
+            return {"status": f"OAuth Network Error: {detail}", "source": "codex-doctor"}
+
+        # 官方 CLI 可能在 access token 临近/已经过期时轮换 refresh token。
+        # 仅认证成功且账号 ID 未变化时，才原子回写新的凭证。
+        with open(temp_auth, "r") as auth_file:
+            refreshed = json.load(auth_file)
+        refreshed_account = str((refreshed.get("tokens") or {}).get("account_id") or "")
+        if original_account and refreshed_account != original_account:
+            return {
+                "status": "OAuth Identity Mismatch: account_id",
+                "source": "codex-doctor",
+            }
+        with open(auth_path, "rb") as original_file, open(temp_auth, "rb") as refreshed_file:
+            changed = original_file.read() != refreshed_file.read()
+        if changed:
+            _atomic_copy_file(temp_auth, auth_path, mode=0o600)
+
+        return {
+            "status": "OK",
+            "source": "codex-doctor",
+            "credentials_refreshed": changed,
+        }
+    except subprocess.TimeoutExpired:
+        return {"status": "OAuth Probe Timeout", "source": "codex-doctor"}
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        return {
+            "status": f"OAuth Probe Error: {type(exc).__name__}: {exc}",
+            "source": "codex-doctor",
+        }
+    finally:
+        shutil.rmtree(temp_home, ignore_errors=True)
+
+
+def _query_quota_once(profile_name):
+    """官方 OAuth 探针 + Bearer 额度查询；调用方负责瞬态重试。"""
+    backup_dir = f"{BACKUP_PREFIX}_{profile_name}"
+    auth_path = os.path.join(backup_dir, "auth.json")
+    if not os.path.exists(auth_path):
+        return {"status": "No Auth Data", "auth_status": "No Auth Data"}
+
+    oauth_result = _probe_codex_oauth(profile_name)
+    access_token = ""
+    try:
+        with open(auth_path, "r") as auth_file:
+            auth_data = json.load(auth_file)
+        access_token = (auth_data.get("tokens") or {}).get("access_token", "")
+    except Exception as exc:
+        return {
+            "status": f"Auth Read Error: {type(exc).__name__}: {exc}",
+            "auth_status": oauth_result.get("status", "Unknown"),
+        }
+
+    direct_result = _query_quota_with_token(access_token)
+    result = dict(direct_result)
+    result["auth_status"] = oauth_result.get("status", "Unknown")
+    if oauth_result.get("credentials_refreshed"):
+        result["credentials_refreshed"] = True
+    return result
+
+
+def _is_transient_query_status(status):
+    transient_prefixes = (
+        "OAuth Probe Timeout",
+        "OAuth Probe Error",
+        "OAuth Network Error",
+        "Browser Startup Timeout",
+        "Browser Exited Early",
+        "CDP Timeout",
+        "CDP Connection Closed",
+        "CDP Error",
+        "Page Load Timeout",
+        "Page Context Error",
+        "Fetch Timeout",
+        "Network Error",
+        "Runtime Error",
+        "Parse Error",
+        "Blocked by Cloudflare",
+        "Cookie Identity Missing",
+        "State Promotion Failed",
+        "API Error: HTTP 429",
+        "API Error: HTTP 5",
+    )
+    return str(status).startswith(transient_prefixes)
+
+
+def silent_query_quota(profile_name, max_attempts=2):
+    """额度和官方 OAuth 认证分别判定；任一瞬态失败都会重试。"""
+    attempts = []
+    for attempt in range(max(1, max_attempts)):
+        try:
+            info = _query_quota_once(profile_name)
+        except Exception as exc:
+            info = {"status": f"Runtime Error: query setup: {type(exc).__name__}: {exc}"}
+        status = info.get("status", "Unknown")
+        auth_status = info.get("auth_status")
+        attempt_desc = status
+        if auth_status:
+            attempt_desc += f"; oauth={auth_status}"
+        attempts.append(attempt_desc)
+
+        quota_ok = status == "OK"
+        auth_ok = auth_status == "OK"
+        fully_expired = status == "Token Expired" and auth_status != "OK"
+        retryable = (
+            _is_transient_query_status(status)
+            or (auth_status and _is_transient_query_status(auth_status))
+        )
+        if (quota_ok and auth_ok) or fully_expired or not retryable:
+            break
+        if attempt + 1 < max_attempts:
+            time.sleep(0.8 * (attempt + 1))
+
+    info["attempts"] = len(attempts)
+    if len(attempts) > 1:
+        info["attempt_history"] = attempts[:-1]
+    return info
 
 def load_usage_cache():
     if os.path.exists(USAGE_CACHE_FILE):
@@ -810,13 +1206,33 @@ def load_usage_cache():
 
 def save_usage_cache(cache):
     try:
-        os.makedirs(CODEX_HOME, exist_ok=True)
-        with open(USAGE_CACHE_FILE, 'w') as f:
-            json.dump(cache, f, indent=2)
+        payload = json.dumps(cache, indent=2)
+        _atomic_write_text(USAGE_CACHE_FILE, payload, mode=0o600)
     except Exception:
         pass
 
-def cmd_list(refresh=False, target_profile=None):
+
+def _record_usage_result(cache, profile_name, info, timestamp=None):
+    """成功结果替换缓存；瞬态失败只记告警，不抹掉最近一次成功额度。"""
+    now = time.time() if timestamp is None else timestamp
+    previous = cache.get(profile_name) or {}
+    previous_limits = previous.get("limits") or {}
+
+    if info.get("status") == "OK" or previous_limits.get("status") != "OK":
+        cache[profile_name] = {
+            "limits": info,
+            "timestamp": now,
+        }
+        return
+
+    preserved = dict(previous)
+    preserved["last_error"] = {
+        "limits": info,
+        "timestamp": now,
+    }
+    cache[profile_name] = preserved
+
+def _cmd_list_impl(refresh=False, target_profile=None):
     profiles = get_profiles()
     current = get_current_active()
     
@@ -835,16 +1251,19 @@ def cmd_list(refresh=False, target_profile=None):
         # 在现查开始前，如果要刷新的账号里包含当前的 ACTIVE 账号，自动增量备份其最新登录态
         if current and current in to_refresh:
             backup_profile(current, quiet=True)
-        print("正在静默现查指定账号的限额与额度..." if target_profile else "正在静默现查所有账号的限额与额度 (后台无头执行，不打扰当前客户端)...")
+        print("正在静默现查指定账号的限额与额度..." if target_profile else "正在静默现查所有账号的限额与额度 (官方 OAuth 探针，不打扰当前客户端)...")
         # 对每一个 profile 现查
         for i, p in enumerate(to_refresh):
             print(f"  [{i+1}/{len(to_refresh)}] 正在查询账号: {p} ...", end="", flush=True)
             info = silent_query_quota(p)
-            usage_cache[p] = {
-                "limits": info,
-                "timestamp": time.time()
-            }
-            print(f" {GREEN}完成{RESET}")
+            _record_usage_result(usage_cache, p, info)
+            auth_status = info.get("auth_status")
+            if info.get("status") == "OK" and auth_status == "OK":
+                print(f" {GREEN}额度与 OAuth 认证均成功{RESET}")
+            elif info.get("status") == "OK":
+                print(f" {YELLOW}额度成功，OAuth 告警: {auth_status or 'Unknown'}{RESET}")
+            else:
+                print(f" {YELLOW}{info.get('status', 'Unknown')}{RESET}")
         save_usage_cache(usage_cache)
         print("")
 
@@ -954,6 +1373,24 @@ def cmd_list(refresh=False, target_profile=None):
                 quota_str += " (刚刚更新)"
             else:
                 quota_str += f" ({mins_ago}分钟前)"
+
+        # 若最近刷新失败但仍有成功额度，保留额度并附加告警，不制造“整行超时”。
+        last_error = usage_data.get("last_error") or {}
+        last_error_limits = last_error.get("limits") or {}
+        last_error_status = last_error_limits.get("status")
+        if last_error_status:
+            error_ts = last_error.get("timestamp")
+            error_age = "刚刚"
+            if error_ts:
+                error_mins = int((time.time() - error_ts) / 60)
+                error_age = "刚刚" if error_mins == 0 else f"{error_mins}分钟前"
+            quota_str += f" | {YELLOW}刷新失败: {last_error_status} ({error_age}){RESET}"
+
+        auth_status = limits.get("auth_status")
+        if auth_status is None:
+            auth_status = limits.get("heartbeat_status")  # 兼容旧缓存
+        if auth_status and auth_status != "OK":
+            quota_str += f" | {YELLOW}OAuth 告警: {auth_status}{RESET}"
                 
         # 纯文本对齐，避免 ANSI 导致排版崩塌
         active_val = "* ACTIVE" if is_active else ""
@@ -976,6 +1413,16 @@ def cmd_list(refresh=False, target_profile=None):
     if not refresh:
         print(f"提示: 以上额度用量基于缓存展示。运行 {BOLD}python3 codex_mgr.py list --refresh{RESET} 可静默现查最新额度。")
     print(f"提示: 后台守护服务每半小时会自动保活并刷新用量缓存。")
+
+
+def cmd_list(refresh=False, target_profile=None):
+    if not refresh:
+        return _cmd_list_impl(refresh=False, target_profile=target_profile)
+    with operation_lock(timeout=60) as acquired:
+        if not acquired:
+            print(f"{YELLOW}已有账号切换/刷新/保活操作正在运行，请稍后重试。{RESET}")
+            return
+        return _cmd_list_impl(refresh=True, target_profile=target_profile)
 
 def format_window_name(seconds):
     """根据秒数动态计算人性化的窗口长度名称。"""
@@ -1008,6 +1455,20 @@ def _pretty_status_desc(status):
         return "Token Expired (Session已失效/在其他设备被踢，需重新登录)"
     if status == "Network Timeout":
         return "Network Timeout (接口请求超时，请检查您的代理/节点速度)"
+    if status == "Fetch Timeout":
+        return "Fetch Timeout (用量接口在 20 秒内未返回)"
+    if status.startswith("Browser Startup Timeout"):
+        return f"浏览器启动超时 ({status})"
+    if status.startswith("Page Load Timeout"):
+        return f"页面加载超时 ({status})"
+    if status.startswith("CDP Timeout"):
+        return f"CDP 通信超时 ({status})"
+    if status.startswith("Network Error"):
+        return f"浏览器网络错误 ({status})"
+    if status.startswith("Page Context Error"):
+        return f"页面上下文失效 ({status})"
+    if status.startswith("Runtime Error"):
+        return f"后台认证查询运行错误 ({status})"
     if status == "Blocked by Cloudflare":
         return "Blocked by Cloudflare (被 OpenAI 防机器人墙拦截，请尝试切换干净的节点)"
     if status == "Empty Response":
@@ -1040,21 +1501,22 @@ def _log_status(ok, detail=""):
     return f"{mark}  {pretty_detail}"
 
 def _is_query_ok(info):
-    """额度/心跳查询是否成功。"""
-    return (info or {}).get("status") == "OK"
+    """额度与官方 OAuth 认证都成功才算一轮完整保活成功。"""
+    info = info or {}
+    return info.get("status") == "OK" and info.get("auth_status") == "OK"
 
 
-def cmd_wakeup():
+def _cmd_wakeup_impl():
     """
     执行一轮账号保活与额度刷新。
 
     处理分工：
       · 前台活跃账号：
           1) live → 备份（同步 App 正在使用的最新 Cookie/Token，不关闭 App）
-          2) 无头额度查询 + Session 校验，并把可能滚动的 Cookie 写回备份
-             （前台 App 自身心跳已维持 live Session；此处主要保备份与额度缓存）
+          2) 官方 OAuth 认证探针 + 额度查询，并安全接收可能轮换的凭证
+             （前台 App 自身维持 live Session；此处同步备份并验证 OAuth）
       · 后台账号：
-          无头心跳保活 + 额度刷新 + Cookie 回写备份（防止长期不用掉登）
+          官方 Codex OAuth 探针 + 额度刷新（防止长期不用后凭证过期）
     """
     sep = "=" * 60
     thin = "-" * 60
@@ -1098,26 +1560,36 @@ def cmd_wakeup():
     if not sync_ok:
         results.append(("前台", current_active, False, "备份同步失败"))
     else:
-        print(f"  · 额度查询 / Session 校验 ... 进行中")
+        print(f"  · 额度查询 / OAuth 校验 ..... 进行中")
         active_info = silent_query_quota(current_active)
         status = active_info.get("status", "Unknown")
         ok = _is_query_ok(active_info)
-        print(f"  · 额度查询 / Session 校验 ... {_log_status(ok, status)}")
+        detail = status
+        if status == "OK" and active_info.get("auth_status") != "OK":
+            detail = f"OAuth Error: {active_info.get('auth_status', 'Unknown')}"
+        print(f"  · 额度查询 / OAuth 校验 ..... {_log_status(ok, detail)}")
+        if active_info.get("auth_status") != "OK":
+            print(f"  · OAuth 保活告警 ............ {active_info.get('auth_status', 'Unknown')}")
         _check_token_status(current_active, active_info, revoked_accounts)
-        usage_cache[current_active] = {"limits": active_info, "timestamp": time.time()}
-        results.append(("前台", current_active, ok, status))
+        _record_usage_result(usage_cache, current_active, active_info)
+        results.append(("前台", current_active, ok, detail))
 
     # ── 后台账号 ──────────────────────────────────────────────────
     for i, p in enumerate(background_profiles, 1):
         print(f"[后台 {i}/{len(background_profiles)}] {p}")
-        print(f"  · 无头心跳保活 ............. 进行中")
+        print(f"  · OAuth 探针 / 额度刷新 ..... 进行中")
         info = silent_query_quota(p)
         status = info.get("status", "Unknown")
         ok = _is_query_ok(info)
-        print(f"  · 无头心跳保活 ............. {_log_status(ok, status)}")
+        detail = status
+        if status == "OK" and info.get("auth_status") != "OK":
+            detail = f"OAuth Error: {info.get('auth_status', 'Unknown')}"
+        print(f"  · OAuth 探针 / 额度刷新 ..... {_log_status(ok, detail)}")
+        if info.get("auth_status") != "OK":
+            print(f"  · OAuth 保活告警 ............ {info.get('auth_status', 'Unknown')}")
         _check_token_status(p, info, revoked_accounts)
-        usage_cache[p] = {"limits": info, "timestamp": time.time()}
-        results.append(("后台", p, ok, status))
+        _record_usage_result(usage_cache, p, info)
+        results.append(("后台", p, ok, detail))
 
     save_usage_cache(usage_cache)
 
@@ -1139,6 +1611,15 @@ def cmd_wakeup():
     print(sep)
 
 
+def cmd_wakeup():
+    with operation_lock(timeout=2) as acquired:
+        if not acquired:
+            print("保活跳过: 另一个账号切换/刷新/保活操作正在运行")
+            return False
+        _cmd_wakeup_impl()
+        return True
+
+
 def _check_token_status(profile_name, info, revoked_accounts):
     """检测账号 session 是否被服务器撤销；失效时仅记入列表，汇总区统一打印。"""
     if (info or {}).get("status") == "Token Expired":
@@ -1146,8 +1627,78 @@ def _check_token_status(profile_name, info, revoked_accounts):
             revoked_accounts.append(profile_name)
 
 
+def _acquire_daemon_singleton():
+    """Python 进程自身持有 flock；shell PID 检测失误也不会产生双守护。"""
+    global _DAEMON_LOCK_FD
+    os.makedirs(CODEX_HOME, exist_ok=True)
+    lock_file = open(DAEMON_LOCK_FILE, "a+")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return False
+    _DAEMON_LOCK_FD = lock_file
+    _atomic_write_text(DAEMON_PID_FILE, f"{os.getpid()}\n", mode=0o600)
+    return True
+
+
+def _release_daemon_singleton():
+    global _DAEMON_LOCK_FD
+    try:
+        if os.path.exists(DAEMON_PID_FILE):
+            with open(DAEMON_PID_FILE, "r") as pid_file:
+                recorded_pid = pid_file.read().strip()
+            if recorded_pid == str(os.getpid()):
+                os.unlink(DAEMON_PID_FILE)
+    except Exception:
+        pass
+    if _DAEMON_LOCK_FD is not None:
+        try:
+            fcntl.flock(_DAEMON_LOCK_FD.fileno(), fcntl.LOCK_UN)
+            _DAEMON_LOCK_FD.close()
+        except Exception:
+            pass
+        _DAEMON_LOCK_FD = None
+
+
+def _start_caffeinate_for_daemon():
+    """由已脱离终端的 Python 守护进程持有睡眠抑制子进程。"""
+    try:
+        proc = subprocess.Popen(
+            ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _atomic_write_text(CAFFEINATE_PID_FILE, f"{proc.pid}\n", mode=0o600)
+        return proc
+    except Exception as exc:
+        print(f"警告: caffeinate 启动失败，系统睡眠时保活可能暂停: {exc}")
+        return None
+
+
+def _stop_caffeinate_for_daemon(proc):
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    try:
+        if os.path.exists(CAFFEINATE_PID_FILE):
+            os.unlink(CAFFEINATE_PID_FILE)
+    except Exception:
+        pass
+
+
 def cmd_daemon():
-    import signal
+    if not _acquire_daemon_singleton():
+        print("守护进程启动跳过: 已有实例持有单例锁")
+        return
 
     # 标准 Unix Daemon 化：创建新会话，彻底脱离控制终端
     try:
@@ -1155,9 +1706,11 @@ def cmd_daemon():
     except OSError:
         pass  # 已是会话 leader，忽略
 
+    caffeinate_proc = _start_caffeinate_for_daemon()
+
     def _sigterm_handler(signum, frame):
         print("守护进程收到停止信号，正在退出...")
-        sys.exit(0)
+        raise SystemExit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
     interval_sec = 1800
@@ -1168,21 +1721,40 @@ def cmd_daemon():
     print("Codex 保活守护进程已启动")
     print(f"  PID: {os.getpid()}")
     print(f"  周期: 每 {interval_min} 分钟执行一轮")
-    print("  动作: 前台同步备份+额度校验 | 后台无头心跳保活")
+    print(f"  网络: {get_network_mode()} ({NETWORK_MODE_ENV})")
+    print("  动作: 前台同步备份+额度校验 | 后台官方 OAuth 探针")
     print("=" * 60)
 
+    next_run = time.monotonic()
     try:
         while True:
             cycle += 1
             print("")
             print(f">>> 第 {cycle} 轮")
-            cmd_wakeup()
-            next_at = datetime.datetime.now() + datetime.timedelta(seconds=interval_sec)
+            try:
+                ran = cmd_wakeup()
+            except Exception as exc:
+                ran = False
+                print(f"本轮发生未捕获异常，守护进程将继续运行: {type(exc).__name__}: {exc}")
+
+            # 固定节拍，避免“执行耗时 + 30分钟”持续漂移；操作锁忙时 60 秒后再试。
+            if ran is False:
+                next_run = time.monotonic() + 60
+                delay = 60
+            else:
+                next_run += interval_sec
+                if next_run <= time.monotonic():
+                    next_run = time.monotonic() + interval_sec
+                delay = max(1, next_run - time.monotonic())
+            next_at = datetime.datetime.now() + datetime.timedelta(seconds=delay)
             next_str = next_at.strftime("%Y-%m-%d %H:%M:%S")
-            print(f"本轮结束，休眠 {interval_min} 分钟；预计下次: {next_str}")
-            time.sleep(interval_sec)
+            print(f"本轮结束，预计下次: {next_str}")
+            time.sleep(delay)
     except (KeyboardInterrupt, SystemExit):
         print("守护进程已安全退出。")
+    finally:
+        _stop_caffeinate_for_daemon(caffeinate_proc)
+        _release_daemon_singleton()
 
 
 def print_help():
@@ -1207,6 +1779,14 @@ def _disable_ansi_colors():
     """写入日志文件时关闭 ANSI 颜色，避免出现 [92m 这类乱码。"""
     global GREEN, RED, YELLOW, CYAN, BOLD, RESET
     GREEN = RED = YELLOW = CYAN = BOLD = RESET = ""
+
+
+def _run_locked(action, timeout=60):
+    with operation_lock(timeout=timeout) as acquired:
+        if not acquired:
+            print(f"{YELLOW}已有账号切换/刷新/保活操作正在运行，请稍后重试。{RESET}")
+            return None
+        return action()
 
 
 def main():
@@ -1253,19 +1833,19 @@ def main():
         cmd_list(refresh, target_profile)
     elif cmd == "add":
         profile = sys.argv[2] if len(sys.argv) > 2 else None
-        cmd_add(profile)
+        _run_locked(lambda: cmd_add(profile))
     elif cmd == "switch":
         if len(sys.argv) < 3:
             print("错误: 请指定要切换的目标账号 Profile 名称。")
             print("示例: python3 codex_mgr.py switch account1")
             sys.exit(1)
-        cmd_switch(sys.argv[2])
+        _run_locked(lambda: cmd_switch(sys.argv[2]))
     elif cmd in ["del", "remove"]:
         if len(sys.argv) < 3:
             print("错误: 请指定要删除的账号 Profile 名称。")
             print("示例: python3 codex_mgr.py del account1")
             sys.exit(1)
-        cmd_del(sys.argv[2])
+        _run_locked(lambda: cmd_del(sys.argv[2]))
     elif cmd == "wakeup":
         cmd_wakeup()
     elif cmd == "daemon":
