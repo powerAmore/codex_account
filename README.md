@@ -8,67 +8,88 @@
 
 ## 📂 项目文件清单
 
-1.  **`codex_mgr.py`**：核心 Python 管理 CLI。
-    *   `list`：本地解码各账号的凭证（`auth.json`），极其直观地列出所有 Profile 的绑定邮箱、计划类型（Plus/Free）、到期日及限额使用情况。
-    *   `list --refresh` (或 `-r`)：通过官方 Codex OAuth 认证探针在线现查额度并验证登录态；失败时保留最近一次成功缓存并显示真实原因。
-    *   `add <name>`：将您当前的登录态备份另存为一个全新的 Profile 账号（如果不传名字，则自动读取解密真实姓名做别名）。
-    *   `switch <name>`：一键备份当前账号，无缝切换到目标账号并重新打开客户端。
-    *   `switch new`：准备一个干净的“未登录”客户端环境以供登录并录入新账号（免去在客户端内 Log Out 导致旧 Token 失效的隐患）。
-    *   `wakeup`：对所有账号执行隔离的官方 OAuth 认证探针，同时同步活跃账号备份、按需接收安全的令牌轮换并更新额度缓存。若检测到某账号认证失效，会打印 ⚠️ 醒目警告。
-    *   `daemon`：常驻后台定时执行唤醒。
-2.  **`wakeup_daemon.sh`**：守护进程控制脚本。
-    *   `./wakeup_daemon.sh start`：启动常驻后台守护服务，每半小时自动批量刷新保活并更新额度缓存。
-    *   `./wakeup_daemon.sh stop`：停止后台守护服务。
-    *   `./wakeup_daemon.sh restart`：一键安全重启后台守护服务并继承/追加历史日志。
-    *   `./wakeup_daemon.sh status`：查看运行状态及最近日志（已支持每行记录精确时间戳前缀）。
-    *   `./wakeup_daemon.sh log`：实时查看输出日志。
+1. `codex_mgr.py`：核心 Python 管理 CLI。
+  - `list`：本地解码各账号的凭证（`auth.json`），极其直观地列出所有 Profile 的绑定邮箱、计划类型（Plus/Free）、到期日及限额使用情况。
+  - `list --refresh` (或 `-r`)：通过官方 Codex OAuth 认证探针在线现查额度并验证登录态；失败时保留最近一次成功缓存并显示真实原因。
+  - `add <name>`：将您当前的登录态备份另存为一个全新的 Profile 账号（如果不传名字，则自动读取解密真实姓名做别名）。
+  - `switch <name>`：一键备份当前账号，无缝切换到目标账号并重新打开客户端。
+  - `switch new`：准备一个干净的“未登录”客户端环境以供登录并录入新账号（免去在客户端内 Log Out 导致旧 Token 失效的隐患）。
+  - `del/remove <name>`：永久删除指定账号 Profile 的本地备份和用量缓存。
+  - `wakeup`：对所有账号执行隔离的官方 OAuth 认证探针，同时同步活跃账号备份、按需接收安全的令牌轮换并更新额度缓存。若检测到某账号认证失效，会打印 ⚠️ 醒目警告。
+  - `daemon`：常驻后台定时执行唤醒。
+2. `wakeup_daemon.sh`：守护进程控制脚本。
+  - `./wakeup_daemon.sh start`：启动常驻后台守护服务，每半小时自动批量刷新保活并更新额度缓存。
+  - `./wakeup_daemon.sh stop`：停止后台守护服务。
+  - `./wakeup_daemon.sh restart`：一键安全重启后台守护服务并继承/追加历史日志。
+  - `./wakeup_daemon.sh status`：查看运行状态及最近日志（已支持每行记录精确时间戳前缀）。
+  - `./wakeup_daemon.sh log`：实时查看输出日志。
 
 ---
 
+
+
 ## ⚙️ 账号初始化与无感录入
+
 为了防止在客户端手动选择 **Log out**（注销）导致前一个账号在服务器端的 Token 被注销失效，请严格使用以下流程来多账号无感录入：
 
 ### 1. 配置第一个账号
+
 1. 正常打开 ChatGPT / Codex 客户端登录您的第一个账号。
 2. 登录成功后，在终端中直接运行以下命令以自动备份（将根据用户真实姓名自动起别名，如 `Julie_Perry`）：
-   ```bash
+  ```bash
    python3 codex_mgr.py add
-   ```
+  ```
+
+
 
 ### 2. 配置第二个及后续账号（安全免注销）
+
 1. **重置环境**：在终端运行特殊切换命令（程序会自动增量备份当前活跃号 Julie_Perry，并将前台重置为干净的“未登录”环境，拉起客户端）：
-   ```bash
+  ```bash
    python3 codex_mgr.py switch new
-   ```
+  ```
 2. **输入登录**：在弹出的全新客户端界面中，输入您的第二个新账号的账号密码并登录成功。
 3. **建立备份**：登录成功后，在终端运行以下命令即可：
-   ```bash
+  ```bash
    python3 codex_mgr.py add
-   ```
+  ```
    *(新账号会被安全地自动解析并创建第二个备份。如果之后需要录入第三个账号，请重复上述步骤。)*
 
 ---
 
+
+
 ## 🚀 常用操作
 
+
+
 ### 1. 查看账号列表与额度
-*   **快速查看** (毫秒级响应，读取本地缓存)：
-    ```bash
-    python3 codex_mgr.py list
-    ```
-*   **手动在线现查** (通过官方 Codex 认证探针，通常数秒完成)：
-    ```bash
-    python3 codex_mgr.py list --refresh
-    ```
+
+- **快速查看** (毫秒级响应，读取本地缓存)：
+  ```bash
+  python3 codex_mgr.py list
+  ```
+- **手动在线现查** (通过官方 Codex 认证探针，通常数秒完成)：
+  ```bash
+  python3 codex_mgr.py list --refresh
+  ```
+
+
 
 ### 2. 手动切换账号
+
 直接运行以下命令即可无缝换号（自动备份当前，加载目标并重启客户端）：
+
 ```bash
 python3 codex_mgr.py switch <Profile名称>
 ```
 
+
+
 ### 3. 常驻后台自动保活防掉登
+
 后台守护每半小时自动保活一次，**全程不干扰您当前正在使用的账号和客户端**：
+
 - 正在前台使用的账号：由 ChatGPT App 自身后台心跳维持，守护进程会同步其最新数据到备份
 - 后台未使用的账号：各自在临时 `CODEX_HOME` 中运行官方 OAuth 认证探针，与前台完全隔离
 - 若检测到任意账号 Session 被撤销（如在其他设备退出所有设备、修改密码等），会在日志中打印 ⚠️ 警告
@@ -81,24 +102,37 @@ CODEX_MGR_NETWORK_MODE=env ./wakeup_daemon.sh restart
 
 `tun` 与 `env` 两种模式不要同时叠加。额度查询与 OAuth 认证会分别记录；只有官方认证 WebSocket 成功才算完整保活成功。日常守护不再拉起无头 ChatGPT，也不再用网页 Cookie 代替 Codex OAuth 登录态。
 
-*   **启动服务**：
-    ```bash
-    ./wakeup_daemon.sh start
-    ```
-*   **查看状态**：
-    ```bash
-    ./wakeup_daemon.sh status
-    ```
-*   **实时查看日志**（含时间戳，可观察保活进度和警告）：
-    ```bash
-    ./wakeup_daemon.sh log
-    ```
+- **启动服务**：
+  ```bash
+  ./wakeup_daemon.sh start
+  ```
+- **查看状态**：
+  ```bash
+  ./wakeup_daemon.sh status
+  ```
+- **实时查看日志**（含时间戳，可观察保活进度和警告）：
+  ```bash
+  ./wakeup_daemon.sh log
+  ```
+
+### 4. 删除账号 Profile
+
+如果您不再需要某个账号，可以将其本地备份和缓存永久删除：
+
+```bash
+python3 codex_mgr.py del <Profile名称>
+# 或
+python3 codex_mgr.py remove <Profile名称>
+```
 
 ---
+
+
 
 ## ⚠️ Session 失效处理
 
 以下操作会导致某账号在**所有设备**上的 Session 同时失效（本工具无法阻止）：
+
 - 在任意设备点击「Sign out of all devices / 退出所有设备」
 - 修改该账号密码或启用二步验证
 - OpenAI 主动风控（IP 剧烈变动等）
@@ -107,6 +141,7 @@ CODEX_MGR_NETWORK_MODE=env ./wakeup_daemon.sh restart
 > 普通的多设备登录**不会**让本机 Session 失效，每台设备的 Session 是独立的。
 
 **发现失效后的处理步骤**：
+
 ```bash
 # 1. 切换到失效账号（会重置为干净的登录环境）
 python3 codex_mgr.py switch new   # 如果是新号入录场景
@@ -123,9 +158,13 @@ python3 codex_mgr.py add <账号名称>  # 使用原来的名称覆盖重建
 
 ---
 
+
+
 ## 🔒 账号防掉登保活优化指南
 
 OpenAI 拥有极为严格的 Cloudflare 节点风控，容易因为 IP 剧烈跳变强制将会话失效。
+
 > [!TIP]
 > **锁定代理节点出口**：
 > 建议在您的代理工具（如 Clash / Surge / Shadowrocket）的**路由规则 (Rules)** 中，将 `openai.com` 和 `chatgpt.com` 的域名锁定到**相对固定的静态 IP 节点**或专门的专线节点，避免使用代理组的负载均衡自动轮询。这能大幅提升本地 Token 的存活时长，甚至做到持久在线。
+

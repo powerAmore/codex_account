@@ -1327,41 +1327,7 @@ def _cmd_list_impl(refresh=False, target_profile=None):
             quota_str = f"{YELLOW}No Data (请使用 --refresh 现查){RESET}"
         elif limits_status == "OK" and "rate_limit" in limits:
             rl = limits.get("rate_limit") or {}
-            parts = []
-            
-            for key in ["primary_window", "secondary_window"]:
-                win = rl.get(key)
-                if not isinstance(win, dict) or not win:
-                    continue
-                
-                # 计算剩余百分比 (剩余 = 100 - 已用)
-                used_pct = win.get("used_percent", 0)
-                pct_left = 100 - used_pct
-                
-                # 如果剩余配额偏低，以红色警示；健康状态下以绿色呈现
-                pct_str = f"{RED}{pct_left}%{RESET}" if pct_left <= 15 else f"{GREEN}{pct_left}%{RESET}"
-                
-                # 重置时间
-                r_str = ""
-                r_ts = win.get("reset_at")
-                window_seconds = win.get("limit_window_seconds", 0)
-                
-                if r_ts:
-                    try:
-                        dt = datetime.datetime.fromtimestamp(r_ts)
-                        # 如果是短期窗口（小于1天），用 12 小时制显示时间 (如 5:52 PM)
-                        if window_seconds < 86400:
-                            r_str = " " + dt.strftime("%I:%M %p").lstrip('0')
-                        else:
-                            # 长期窗口（大于等于1天），用月日显示 (如 Jul 20)
-                            r_str = " " + dt.strftime("%b %d")
-                    except Exception:
-                        pass
-                
-                win_name = format_window_name(window_seconds)
-                parts.append(f"{win_name}: {pct_str}{r_str}")
-                
-            quota_str = " | ".join(parts) if parts else "OK"
+            quota_str = format_rate_limit(rl, use_color=True)
         else:
             quota_str = limits_status
                 
@@ -1445,12 +1411,55 @@ def format_window_name(seconds):
         return f"{int(hours)}小时"
     return f"{seconds}秒"
 
+def format_rate_limit(rl, use_color=True):
+    """把 rate_limit 字典格式化为适合单行或日志打印的额度用量文本。"""
+    if not isinstance(rl, dict) or not rl:
+        return "OK"
+    parts = []
+    for key in ["primary_window", "secondary_window"]:
+        win = rl.get(key)
+        if not isinstance(win, dict) or not win:
+            continue
+        
+        # 计算剩余百分比 (剩余 = 100 - 已用)
+        used_pct = win.get("used_percent", 0)
+        pct_left = 100 - used_pct
+        
+        if use_color:
+            pct_str = f"{RED}{pct_left}%{RESET}" if pct_left <= 15 else f"{GREEN}{pct_left}%{RESET}"
+        else:
+            pct_str = f"{pct_left}%"
+            
+        # 重置时间
+        r_str = ""
+        r_ts = win.get("reset_at")
+        window_seconds = win.get("limit_window_seconds", 0)
+        
+        if r_ts:
+            try:
+                dt = datetime.datetime.fromtimestamp(r_ts)
+                # 如果是短期窗口（小于1天），用 12 小时制显示时间 (如 5:52 PM)
+                if window_seconds < 86400:
+                    r_str = " " + dt.strftime("%I:%M %p").lstrip('0')
+                else:
+                    # 长期窗口（大于等于1天），用月日显示 (如 Jul 20)
+                    r_str = " " + dt.strftime("%b %d")
+            except Exception:
+                pass
+                
+        win_name = format_window_name(window_seconds)
+        parts.append(f"{win_name}: {pct_str}{r_str}")
+        
+    return " | ".join(parts) if parts else "OK"
+
 def _pretty_status_desc(status):
     """把接口底层的英文/异常状态翻译并附带人机友好的详细解释。"""
     if not status:
         return "Unknown"
     if status == "OK":
         return "OK"
+    if status.startswith("OK ("):
+        return status
     if status == "Token Expired":
         return "Token Expired (Session已失效/在其他设备被踢，需重新登录)"
     if status == "Network Timeout":
@@ -1498,6 +1507,8 @@ def _log_status(ok, detail=""):
     if not detail or detail == mark:
         return mark
     pretty_detail = _pretty_status_desc(detail)
+    if pretty_detail.startswith("OK ("):
+        return pretty_detail
     return f"{mark}  {pretty_detail}"
 
 def _is_query_ok(info):
@@ -1565,7 +1576,9 @@ def _cmd_wakeup_impl():
         status = active_info.get("status", "Unknown")
         ok = _is_query_ok(active_info)
         detail = status
-        if status == "OK" and active_info.get("auth_status") != "OK":
+        if ok:
+            detail = f"OK ({format_rate_limit(active_info.get('rate_limit'), use_color=False)})"
+        elif status == "OK" and active_info.get("auth_status") != "OK":
             detail = f"OAuth Error: {active_info.get('auth_status', 'Unknown')}"
         print(f"  · 额度查询 / OAuth 校验 ..... {_log_status(ok, detail)}")
         if active_info.get("auth_status") != "OK":
@@ -1582,7 +1595,9 @@ def _cmd_wakeup_impl():
         status = info.get("status", "Unknown")
         ok = _is_query_ok(info)
         detail = status
-        if status == "OK" and info.get("auth_status") != "OK":
+        if ok:
+            detail = f"OK ({format_rate_limit(info.get('rate_limit'), use_color=False)})"
+        elif status == "OK" and info.get("auth_status") != "OK":
             detail = f"OAuth Error: {info.get('auth_status', 'Unknown')}"
         print(f"  · OAuth 探针 / 额度刷新 ..... {_log_status(ok, detail)}")
         if info.get("auth_status") != "OK":
