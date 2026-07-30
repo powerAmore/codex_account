@@ -102,6 +102,8 @@ CODEX_MGR_NETWORK_MODE=env ./wakeup_daemon.sh restart
 
 `tun` 与 `env` 两种模式不要同时叠加。额度查询与 OAuth 认证会分别记录；只有官方认证 WebSocket 成功才算完整保活成功。日常守护不再拉起无头 ChatGPT，也不再用网页 Cookie 代替 Codex OAuth 登录态。
 
+额度接口兼容 `codex/usage` 与 `wham/usage` 两条官方路径：如果某个 Cloudflare 边缘节点只挑战其中一条，程序会自动切换另一条；只有两条都失败才会把本轮额度标记为失败。单次 `Blocked by Cloudflare` 不再直接等同于账号掉登。
+
 - **启动服务**：
   ```bash
   ./wakeup_daemon.sh start
@@ -167,4 +169,3 @@ OpenAI 拥有极为严格的 Cloudflare 节点风控，容易因为 IP 剧烈跳
 > [!TIP]
 > **锁定代理节点出口**：
 > 建议在您的代理工具（如 Clash / Surge / Shadowrocket）的**路由规则 (Rules)** 中，将 `openai.com` 和 `chatgpt.com` 的域名锁定到**相对固定的静态 IP 节点**或专门的专线节点，避免使用代理组的负载均衡自动轮询。这能大幅提升本地 Token 的存活时长，甚至做到持久在线。
-

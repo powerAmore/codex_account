@@ -1,10 +1,12 @@
 import json
+import io
 import os
 import pathlib
 import sqlite3
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 
@@ -85,6 +87,36 @@ class QuotaParsingTests(unittest.TestCase):
         self.assertEqual(result["status"], "OK")
         self.assertEqual(result["source"], "bearer")
 
+    def test_bearer_query_falls_back_from_cloudflare_path(self):
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"rate_limit": {"primary_window": {}}}).encode()
+
+        blocked = urllib.error.HTTPError(
+            "https://chatgpt.com/backend-api/codex/usage",
+            403,
+            "Forbidden",
+            {"cf-ray": "test-ray"},
+            io.BytesIO(b"challenge"),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = [blocked, FakeResponse()]
+        with mock.patch("codex_mgr._url_opener_for_network_mode", return_value=opener):
+            result = codex_mgr._query_quota_with_token("test-token")
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["quota_endpoint"], "wham/usage")
+        self.assertTrue(result["quota_fallback_used"])
+        self.assertEqual(result["quota_endpoints_tried"], ["codex/usage", "wham/usage"])
+
     def test_tun_mode_disables_application_proxy(self):
         with mock.patch.dict(os.environ, {"CODEX_MGR_NETWORK_MODE": "tun"}):
             self.assertEqual(codex_mgr.get_network_mode(), "tun")
@@ -109,9 +141,9 @@ class QuotaParsingTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Mismatch", status)
 
-    def test_oauth_probe_failure_is_retried(self):
+    def test_quota_transient_failure_is_retried(self):
         responses = [
-            {"status": "OK", "auth_status": "OAuth Probe Timeout"},
+            {"status": "Blocked by Cloudflare", "auth_status": "OAuth Probe Timeout"},
             {"status": "OK", "auth_status": "OK"},
         ]
         with mock.patch("codex_mgr._query_quota_once", side_effect=responses):
@@ -119,6 +151,22 @@ class QuotaParsingTests(unittest.TestCase):
         self.assertEqual(result["status"], "OK")
         self.assertEqual(result["auth_status"], "OK")
         self.assertEqual(result["attempts"], 2)
+
+    def test_quota_success_with_oauth_network_warning_is_usable(self):
+        info = {
+            "status": "OK",
+            "auth_status": "OAuth Network Error: websocket failed",
+        }
+        self.assertTrue(codex_mgr._is_query_ok(info))
+
+    def test_https_quota_success_separates_websocket_warning(self):
+        result = codex_mgr._combine_quota_and_oauth_result(
+            {"status": "OK", "rate_limit": {}},
+            {"status": "OAuth Network Error: websocket timed out"},
+        )
+        self.assertEqual(result["auth_status"], "OK")
+        self.assertEqual(result["auth_transport"], "https")
+        self.assertIn("websocket", result["websocket_warning"])
 
 
 class UsageCacheTests(unittest.TestCase):

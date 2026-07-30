@@ -959,48 +959,87 @@ def _parse_quota_fetch_result(fetch_result):
 
 
 def _query_quota_with_token(access_token, timeout=15):
-    """用未过期的 Bearer Token 直查额度，绕开页面 Service Worker/重定向。"""
+    """用 Bearer Token 查询额度，并在两个官方兼容路径间回退。
+
+    ChatGPT/Codex 后端在不同版本会在 ``codex/usage`` 与 ``wham/usage``
+    之间切换。两者都返回同一份 rate_limit；单一路径被边缘节点挑战时，
+    立即尝试另一路径，避免把一次 Cloudflare 403 当成账号失效。
+    """
     if not access_token:
         return {"status": "No Access Token"}
 
-    request = urllib.request.Request(
+    endpoints = (
         "https://chatgpt.com/backend-api/codex/usage",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-            "User-Agent": "codex_mgr/1.0",
-        },
+        "https://chatgpt.com/backend-api/wham/usage",
     )
-    try:
-        opener = _url_opener_for_network_mode()
-        with opener.open(request, timeout=timeout) as response:
-            raw_body = response.read().decode("utf-8", errors="replace")
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": "codex/0.146.0",
+    }
+    opener = _url_opener_for_network_mode()
+    last_result = {"status": "Unknown"}
+    tried = []
+
+    for endpoint in endpoints:
+        endpoint_name = endpoint.split("/backend-api/", 1)[-1]
+        tried.append(endpoint_name)
+        request = urllib.request.Request(endpoint, headers=headers)
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                raw_body = response.read().decode("utf-8", errors="replace")
+                try:
+                    body = json.loads(raw_body)
+                except json.JSONDecodeError:
+                    body = raw_body
+                result = _parse_quota_fetch_result(
+                    {"kind": "http", "status": response.status, "body": body}
+                )
+        except urllib.error.HTTPError as exc:
+            raw_body = exc.read().decode("utf-8", errors="replace")
             try:
                 body = json.loads(raw_body)
             except json.JSONDecodeError:
                 body = raw_body
             result = _parse_quota_fetch_result(
-                {"kind": "http", "status": response.status, "body": body}
+                {"kind": "http", "status": exc.code, "body": body}
             )
-    except urllib.error.HTTPError as exc:
-        raw_body = exc.read().decode("utf-8", errors="replace")
-        try:
-            body = json.loads(raw_body)
-        except json.JSONDecodeError:
-            body = raw_body
-        result = _parse_quota_fetch_result(
-            {"kind": "http", "status": exc.code, "body": body}
-        )
-    except (TimeoutError, OSError) as exc:
-        if "timed out" in str(exc).lower():
-            result = {"status": "Fetch Timeout"}
-        else:
-            result = {"status": f"Network Error: {exc}"}
-    except Exception as exc:
-        result = {"status": f"Network Error: {type(exc).__name__}: {exc}"}
+            # cf-ray 只用于诊断边缘节点，不记录响应正文或任何凭证。
+            cf_ray = exc.headers.get("cf-ray")
+            if cf_ray:
+                result["cf_ray"] = cf_ray
+        except (TimeoutError, OSError) as exc:
+            if "timed out" in str(exc).lower():
+                result = {"status": "Fetch Timeout"}
+            else:
+                result = {"status": f"Network Error: {exc}"}
+        except Exception as exc:
+            result = {"status": f"Network Error: {type(exc).__name__}: {exc}"}
 
-    result["source"] = "bearer"
-    return result
+        result["source"] = "bearer"
+        result["quota_endpoint"] = endpoint_name
+        if result.get("status") == "OK":
+            if len(tried) > 1:
+                result["quota_fallback_used"] = True
+                result["quota_endpoints_tried"] = tried
+            return result
+
+        last_result = result
+        # 401/Token Expired、解析错误等不应通过另一 URL 掩盖；边缘挑战、
+        # 429/5xx 和网络瞬态才值得切换兼容路径。
+        status = str(result.get("status", ""))
+        retryable = (
+            status in ("Blocked by Cloudflare", "Fetch Timeout")
+            or status.startswith("Network Error")
+            or status.startswith("API Error: HTTP 429")
+            or status.startswith("API Error: HTTP 5")
+        )
+        if not retryable:
+            break
+
+    last_result["source"] = "bearer"
+    last_result["quota_endpoints_tried"] = tried
+    return last_result
 
 
 def _validate_heartbeat_identity(heartbeat, expected_account_id, expected_email):
@@ -1111,6 +1150,30 @@ def _probe_codex_oauth(profile_name, timeout=35):
         shutil.rmtree(temp_home, ignore_errors=True)
 
 
+def _combine_quota_and_oauth_result(direct_result, oauth_result):
+    """合并额度与认证结果，避免把 HTTPS 已认证误报成掉登。"""
+    result = dict(direct_result)
+    oauth_status = oauth_result.get("status", "Unknown")
+
+    # Bearer 额度接口已返回 rate_limit 时，认证已被 HTTPS 服务端确认。
+    # WSS 诊断超时只反映当前 VPN/边缘节点的 WebSocket 可达性，不应覆盖它。
+    if (
+        direct_result.get("status") == "OK"
+        and not _is_hard_auth_failure(oauth_status)
+        and oauth_status != "OK"
+    ):
+        result["auth_status"] = "OK"
+        result["auth_transport"] = "https"
+        result["websocket_warning"] = oauth_status
+    else:
+        result["auth_status"] = oauth_status
+        result["auth_transport"] = "websocket" if oauth_status == "OK" else None
+
+    if oauth_result.get("credentials_refreshed"):
+        result["credentials_refreshed"] = True
+    return result
+
+
 def _query_quota_once(profile_name):
     """官方 OAuth 探针 + Bearer 额度查询；调用方负责瞬态重试。"""
     backup_dir = f"{BACKUP_PREFIX}_{profile_name}"
@@ -1131,11 +1194,7 @@ def _query_quota_once(profile_name):
         }
 
     direct_result = _query_quota_with_token(access_token)
-    result = dict(direct_result)
-    result["auth_status"] = oauth_result.get("status", "Unknown")
-    if oauth_result.get("credentials_refreshed"):
-        result["credentials_refreshed"] = True
-    return result
+    return _combine_quota_and_oauth_result(direct_result, oauth_result)
 
 
 def _is_transient_query_status(status):
@@ -1163,6 +1222,17 @@ def _is_transient_query_status(status):
     return str(status).startswith(transient_prefixes)
 
 
+def _is_hard_auth_failure(status):
+    """只有凭证/身份问题才应覆盖已经成功的 Bearer 额度结果。"""
+    return str(status or "").startswith((
+        "No Auth",
+        "Auth Read Error",
+        "OAuth Credentials Error",
+        "OAuth Identity Mismatch",
+        "Codex CLI Missing",
+    ))
+
+
 def silent_query_quota(profile_name, max_attempts=2):
     """额度和官方 OAuth 认证分别判定；任一瞬态失败都会重试。"""
     attempts = []
@@ -1179,11 +1249,14 @@ def silent_query_quota(profile_name, max_attempts=2):
         attempts.append(attempt_desc)
 
         quota_ok = status == "OK"
-        auth_ok = auth_status == "OK"
-        fully_expired = status == "Token Expired" and auth_status != "OK"
+        auth_ok = auth_status == "OK" or (quota_ok and not _is_hard_auth_failure(auth_status))
+        fully_expired = status == "Token Expired" and _is_hard_auth_failure(auth_status)
         retryable = (
-            _is_transient_query_status(status)
-            or (auth_status and _is_transient_query_status(auth_status))
+            not quota_ok
+            and (
+                _is_transient_query_status(status)
+                or (auth_status and _is_transient_query_status(auth_status))
+            )
         )
         if (quota_ok and auth_ok) or fully_expired or not retryable:
             break
@@ -1259,7 +1332,10 @@ def _cmd_list_impl(refresh=False, target_profile=None):
             _record_usage_result(usage_cache, p, info)
             auth_status = info.get("auth_status")
             if info.get("status") == "OK" and auth_status == "OK":
-                print(f" {GREEN}额度与 OAuth 认证均成功{RESET}")
+                if info.get("auth_transport") == "https" and info.get("websocket_warning"):
+                    print(f" {GREEN}额度与 HTTPS 认证成功（WebSocket 探针超时）{RESET}")
+                else:
+                    print(f" {GREEN}额度与 OAuth 认证均成功{RESET}")
             elif info.get("status") == "OK":
                 print(f" {YELLOW}额度成功，OAuth 告警: {auth_status or 'Unknown'}{RESET}")
             else:
@@ -1512,9 +1588,9 @@ def _log_status(ok, detail=""):
     return f"{mark}  {pretty_detail}"
 
 def _is_query_ok(info):
-    """额度与官方 OAuth 认证都成功才算一轮完整保活成功。"""
+    """额度成功且没有硬凭证/身份错误，即可作为可用结果。"""
     info = info or {}
-    return info.get("status") == "OK" and info.get("auth_status") == "OK"
+    return info.get("status") == "OK" and not _is_hard_auth_failure(info.get("auth_status"))
 
 
 def _cmd_wakeup_impl():
