@@ -5,12 +5,14 @@ import json
 import base64
 import contextlib
 import fcntl
+import re
 import shutil
 import signal
 import subprocess
 import tempfile
 import time
 import datetime
+import unicodedata
 import urllib.request
 import urllib.error
 
@@ -929,7 +931,7 @@ def _parse_quota_fetch_result(fetch_result):
     if isinstance(body, dict):
         if "rate_limit" in body:
             result = {"status": "OK", "rate_limit": body["rate_limit"]}
-            for identity_key in ("account_id", "email", "user_id"):
+            for identity_key in ("account_id", "email", "user_id", "plan_type"):
                 if body.get(identity_key):
                     result[identity_key] = body[identity_key]
             return result
@@ -956,6 +958,17 @@ def _parse_quota_fetch_result(fetch_result):
     if any(word in body_text for word in ("unauthorized", "token is missing", "token_invalidated")):
         return {"status": "Token Expired"}
     return {"status": f"Parse Error: HTTP {http_status}: {str(body)[:100]}"}
+
+
+def _network_failure_status(exc):
+    """把底层网络异常收成稳定状态；SSL 握手超时单独标出便于区分节点问题。"""
+    text = str(exc)
+    lower = text.lower()
+    if "handshake operation timed out" in lower or "handshake timed out" in lower:
+        return "Fetch Timeout: SSL handshake"
+    if "timed out" in lower or isinstance(exc, TimeoutError):
+        return "Fetch Timeout"
+    return f"Network Error: {type(exc).__name__}: {exc}"
 
 
 def _query_quota_with_token(access_token, timeout=15):
@@ -1009,12 +1022,9 @@ def _query_quota_with_token(access_token, timeout=15):
             if cf_ray:
                 result["cf_ray"] = cf_ray
         except (TimeoutError, OSError) as exc:
-            if "timed out" in str(exc).lower():
-                result = {"status": "Fetch Timeout"}
-            else:
-                result = {"status": f"Network Error: {exc}"}
+            result = {"status": _network_failure_status(exc)}
         except Exception as exc:
-            result = {"status": f"Network Error: {type(exc).__name__}: {exc}"}
+            result = {"status": _network_failure_status(exc)}
 
         result["source"] = "bearer"
         result["quota_endpoint"] = endpoint_name
@@ -1030,6 +1040,7 @@ def _query_quota_with_token(access_token, timeout=15):
         status = str(result.get("status", ""))
         retryable = (
             status in ("Blocked by Cloudflare", "Fetch Timeout")
+            or status.startswith("Fetch Timeout:")
             or status.startswith("Network Error")
             or status.startswith("API Error: HTTP 429")
             or status.startswith("API Error: HTTP 5")
@@ -1040,6 +1051,266 @@ def _query_quota_with_token(access_token, timeout=15):
     last_result["source"] = "bearer"
     last_result["quota_endpoints_tried"] = tried
     return last_result
+
+
+def _parse_subscription_fetch_result(fetch_result):
+    """解析 subscriptions 接口，提取 Plan / 到期日等订阅元数据。"""
+    if not isinstance(fetch_result, dict):
+        return {"status": f"Parse Error: {str(fetch_result)[:100]}"}
+
+    if fetch_result.get("kind") == "fetch_error":
+        error_name = str(fetch_result.get("name", ""))
+        message = str(fetch_result.get("message", "Unknown fetch error"))
+        if error_name == "AbortError" or "abort" in message.lower():
+            return {"status": "Fetch Timeout"}
+        return {"status": f"Network Error: {message}"}
+
+    if fetch_result.get("kind") != "http":
+        return {"status": f"Parse Error: {str(fetch_result)[:100]}"}
+
+    http_status = int(fetch_result.get("status") or 0)
+    body = fetch_result.get("body")
+
+    if http_status == 401:
+        return {"status": "Token Expired"}
+    if http_status == 403:
+        return {"status": "Blocked by Cloudflare"}
+    if http_status >= 400:
+        detail = body
+        if isinstance(body, dict):
+            detail = body.get("detail") or body.get("error") or body
+        return {"status": f"API Error: HTTP {http_status}: {str(detail)[:100]}"}
+
+    if not isinstance(body, dict):
+        return {"status": f"Parse Error: HTTP {http_status}: {str(body)[:100]}"}
+
+    plan_type = body.get("plan_type")
+    active_until = body.get("active_until")
+    if not plan_type and not active_until:
+        return {"status": f"Parse Error: missing subscription fields: {str(body)[:100]}"}
+
+    result = {"status": "OK", "source": "subscriptions"}
+    if plan_type:
+        result["plan_type"] = plan_type
+    if active_until:
+        result["subscription_until"] = active_until
+    if body.get("active_start"):
+        result["subscription_active_start"] = body["active_start"]
+    if "will_renew" in body:
+        result["will_renew"] = bool(body.get("will_renew"))
+    if "is_delinquent" in body:
+        result["is_delinquent"] = bool(body.get("is_delinquent"))
+    if body.get("grace_period_end_timestamp"):
+        result["grace_period_end"] = body["grace_period_end_timestamp"]
+    if body.get("billing_period"):
+        result["billing_period"] = body["billing_period"]
+    return result
+
+
+def _query_subscription_with_token(access_token, account_id, timeout=15, max_attempts=2):
+    """用 Bearer Token 查询 ChatGPT 订阅计划与到期日。"""
+    if not access_token:
+        return {"status": "No Access Token"}
+    if not account_id:
+        return {"status": "No Account ID"}
+
+    url = f"https://chatgpt.com/backend-api/subscriptions?account_id={account_id}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": "codex/0.146.0",
+        "ChatGPT-Account-ID": str(account_id),
+        "Referer": "https://chatgpt.com/",
+        "Origin": "https://chatgpt.com",
+    }
+    opener = _url_opener_for_network_mode()
+    last_result = {"status": "Unknown"}
+
+    for attempt in range(max(1, max_attempts)):
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                raw_body = response.read().decode("utf-8", errors="replace")
+                try:
+                    body = json.loads(raw_body)
+                except json.JSONDecodeError:
+                    body = raw_body
+                result = _parse_subscription_fetch_result(
+                    {"kind": "http", "status": response.status, "body": body}
+                )
+        except urllib.error.HTTPError as exc:
+            raw_body = exc.read().decode("utf-8", errors="replace")
+            try:
+                body = json.loads(raw_body)
+            except json.JSONDecodeError:
+                body = raw_body
+            result = _parse_subscription_fetch_result(
+                {"kind": "http", "status": exc.code, "body": body}
+            )
+            cf_ray = exc.headers.get("cf-ray")
+            if cf_ray:
+                result["cf_ray"] = cf_ray
+        except (TimeoutError, OSError) as exc:
+            result = {"status": _network_failure_status(exc)}
+        except Exception as exc:
+            result = {"status": _network_failure_status(exc)}
+
+        last_result = result
+        if result.get("status") == "OK":
+            return result
+
+        status = str(result.get("status", ""))
+        retryable = (
+            status in ("Blocked by Cloudflare", "Fetch Timeout")
+            or status.startswith("Fetch Timeout:")
+            or status.startswith("Network Error")
+            or status.startswith("API Error: HTTP 429")
+            or status.startswith("API Error: HTTP 5")
+        )
+        if not retryable or attempt + 1 >= max_attempts:
+            break
+        time.sleep(0.4)
+
+    return last_result
+
+
+def _merge_subscription_into_quota_result(quota_result, subscription_result):
+    """订阅查询失败不拖垮额度成功；成功则覆盖 Plan / Until。"""
+    result = dict(quota_result)
+    if not isinstance(subscription_result, dict):
+        result["subscription_status"] = "Unknown"
+        return result
+
+    status = subscription_result.get("status", "Unknown")
+    result["subscription_status"] = status
+    if status != "OK":
+        return result
+
+    for key in (
+        "plan_type",
+        "subscription_until",
+        "subscription_active_start",
+        "will_renew",
+        "is_delinquent",
+        "grace_period_end",
+        "billing_period",
+    ):
+        if key in subscription_result:
+            result[key] = subscription_result[key]
+    return result
+
+
+def _date_only(value):
+    """把 ISO 时间戳裁成 YYYY-MM-DD；无法解析时原样返回。"""
+    if not value or value == "Unknown":
+        return value
+    text = str(value).strip()
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    return text[:10] if len(text) >= 10 and text[4] == "-" else text
+
+
+def _mmdd(value):
+    date = _date_only(value)
+    if isinstance(date, str) and len(date) >= 10 and date[4] == "-":
+        return date[5:10]
+    return date
+
+
+def _plan_and_until_from_auth_payload(payload):
+    """从 id_token payload 提取 Plan / Until（本地兜底）。"""
+    plan = "Unknown"
+    until = "Unknown"
+    if not isinstance(payload, dict):
+        return plan, until
+    auth_sec = payload.get("https://api.openai.com/auth", {}) or {}
+    plan = str(auth_sec.get("chatgpt_plan_type", "free") or "free").upper()
+    until_raw = auth_sec.get("chatgpt_subscription_active_until")
+    if until_raw:
+        until = _date_only(until_raw)
+    return plan, until
+
+
+def _format_subscription_until(limits):
+    """格式化缓存中的订阅到期展示；欠费宽限期附在日期后。"""
+    until = _date_only(limits.get("subscription_until") or "Unknown")
+    if until == "Unknown":
+        return until
+    if limits.get("is_delinquent") and limits.get("grace_period_end"):
+        return f"{until} 宽限{_mmdd(limits.get('grace_period_end'))}"
+    if limits.get("will_renew") is False:
+        return f"{until} 不续费"
+    return until
+
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _display_width(text):
+    """终端显示宽度：全角/宽字符计 2，忽略 ANSI 颜色码。"""
+    width = 0
+    for ch in _ANSI_RE.sub("", str(text)):
+        if ch in ("\n", "\r"):
+            continue
+        east = unicodedata.east_asian_width(ch)
+        if east in ("F", "W"):
+            width += 2
+        elif east == "A":
+            # 终端对 ambiguous 宽字符通常按西文宽度渲染；表情等按 2 更稳。
+            width += 2 if ord(ch) > 0xFF else 1
+        else:
+            width += 1
+    return width
+
+
+def _pad_display(text, width, align="<"):
+    """按显示宽度填充，保证中英文混排时后续列对齐。"""
+    text = "" if text is None else str(text)
+    current = _display_width(text)
+    if current > width:
+        # 超宽时截断到可用宽度，避免把后面的列整体挤歪。
+        kept = []
+        used = 0
+        for ch in text:
+            if ch == "\033":
+                # 保底：截断场景通常是纯文本字段，不做复杂 ANSI 截断。
+                break
+            step = _display_width(ch)
+            if used + step > width - 1:
+                break
+            kept.append(ch)
+            used += step
+        text = "".join(kept) + "…"
+        current = _display_width(text)
+    pad = max(0, width - current)
+    if align == ">":
+        return (" " * pad) + text
+    if align == "^":
+        left = pad // 2
+        return (" " * left) + text + (" " * (pad - left))
+    return text + (" " * pad)
+
+
+def _resolve_plan_and_until(auth_path, usage_data):
+    """优先用 refresh 缓存的订阅元数据，否则回退本地 JWT。"""
+    plan = "Unknown"
+    until = "Unknown"
+    if os.path.exists(auth_path):
+        try:
+            with open(auth_path, "r") as auth_file:
+                auth_data = json.load(auth_file)
+            id_token = (auth_data.get("tokens") or {}).get("id_token")
+            if id_token:
+                plan, until = _plan_and_until_from_auth_payload(decode_jwt_payload(id_token))
+        except Exception:
+            pass
+
+    limits = (usage_data or {}).get("limits") or {}
+    if limits.get("plan_type"):
+        plan = str(limits["plan_type"]).upper()
+    if limits.get("subscription_until"):
+        until = _format_subscription_until(limits)
+    return plan, until
 
 
 def _validate_heartbeat_identity(heartbeat, expected_account_id, expected_email):
@@ -1175,7 +1446,7 @@ def _combine_quota_and_oauth_result(direct_result, oauth_result):
 
 
 def _query_quota_once(profile_name):
-    """官方 OAuth 探针 + Bearer 额度查询；调用方负责瞬态重试。"""
+    """官方 OAuth 探针 + Bearer 额度/订阅查询；调用方负责瞬态重试。"""
     backup_dir = f"{BACKUP_PREFIX}_{profile_name}"
     auth_path = os.path.join(backup_dir, "auth.json")
     if not os.path.exists(auth_path):
@@ -1183,10 +1454,13 @@ def _query_quota_once(profile_name):
 
     oauth_result = _probe_codex_oauth(profile_name)
     access_token = ""
+    account_id = ""
     try:
         with open(auth_path, "r") as auth_file:
             auth_data = json.load(auth_file)
-        access_token = (auth_data.get("tokens") or {}).get("access_token", "")
+        tokens = auth_data.get("tokens") or {}
+        access_token = tokens.get("access_token", "")
+        account_id = tokens.get("account_id", "")
     except Exception as exc:
         return {
             "status": f"Auth Read Error: {type(exc).__name__}: {exc}",
@@ -1194,7 +1468,10 @@ def _query_quota_once(profile_name):
         }
 
     direct_result = _query_quota_with_token(access_token)
-    return _combine_quota_and_oauth_result(direct_result, oauth_result)
+    combined = _combine_quota_and_oauth_result(direct_result, oauth_result)
+    # 订阅元数据失败不影响额度成功；list 会继续回退到本地 JWT。
+    subscription_result = _query_subscription_with_token(access_token, account_id)
+    return _merge_subscription_into_quota_result(combined, subscription_result)
 
 
 def _is_transient_query_status(status):
@@ -1210,6 +1487,7 @@ def _is_transient_query_status(status):
         "Page Load Timeout",
         "Page Context Error",
         "Fetch Timeout",
+        "Fetch Timeout:",
         "Network Error",
         "Runtime Error",
         "Parse Error",
@@ -1292,8 +1570,23 @@ def _record_usage_result(cache, profile_name, info, timestamp=None):
     previous_limits = previous.get("limits") or {}
 
     if info.get("status") == "OK" or previous_limits.get("status") != "OK":
+        new_limits = dict(info)
+        # 额度成功但订阅现查失败时，保留上次订阅元数据，避免 Until 回退抖动。
+        if info.get("status") == "OK" and info.get("subscription_status") != "OK":
+            for key in (
+                "subscription_until",
+                "subscription_active_start",
+                "will_renew",
+                "is_delinquent",
+                "grace_period_end",
+                "billing_period",
+            ):
+                if key not in new_limits and key in previous_limits:
+                    new_limits[key] = previous_limits[key]
+            if "plan_type" not in new_limits and previous_limits.get("plan_type"):
+                new_limits["plan_type"] = previous_limits["plan_type"]
         cache[profile_name] = {
-            "limits": info,
+            "limits": new_limits,
             "timestamp": now,
         }
         return
@@ -1324,7 +1617,7 @@ def _cmd_list_impl(refresh=False, target_profile=None):
         # 在现查开始前，如果要刷新的账号里包含当前的 ACTIVE 账号，自动增量备份其最新登录态
         if current and current in to_refresh:
             backup_profile(current, quiet=True)
-        print("正在静默现查指定账号的限额与额度..." if target_profile else "正在静默现查所有账号的限额与额度 (官方 OAuth 探针，不打扰当前客户端)...")
+        print("正在静默现查指定账号的限额、额度与订阅..." if target_profile else "正在静默现查所有账号的限额、额度与订阅 (官方 OAuth 探针，不打扰当前客户端)...")
         # 对每一个 profile 现查
         for i, p in enumerate(to_refresh):
             print(f"  [{i+1}/{len(to_refresh)}] 正在查询账号: {p} ...", end="", flush=True)
@@ -1343,19 +1636,28 @@ def _cmd_list_impl(refresh=False, target_profile=None):
         save_usage_cache(usage_cache)
         print("")
 
-    # 5. 打印表格 (宽版完美对齐)
+    # 5. 打印表格 (按终端显示宽度对齐，兼容中英文混排)
     print(f"\n{BOLD}{CYAN}=== ChatGPT/Codex 账号管理列表 ==={RESET}")
     
     col_active = 10
     col_profile = 25
     col_email = 45
     col_plan = 8
+    # 最长示例: "2026-08-01 宽限08-04" 显示宽度 20
     col_until = 22
+    table_width = col_active + col_profile + col_email + col_plan + col_until + 28
     
-    header = f"{'Active':<{col_active}}{'Profile Name':<{col_profile}}{'Email':<{col_email}}{'Plan':<{col_plan}}{'Subscription Until':<{col_until}}{'Quota / Limit Info'}"
-    print("-" * 135)
+    header = (
+        _pad_display("Active", col_active)
+        + _pad_display("Profile Name", col_profile)
+        + _pad_display("Email", col_email)
+        + _pad_display("Plan", col_plan)
+        + _pad_display("Subscription Until", col_until)
+        + "Quota / Limit Info"
+    )
+    print("-" * table_width)
     print(f"{BOLD}{header}{RESET}")
-    print("-" * 135)
+    print("-" * table_width)
     
     for p in profiles:
         if target_profile and p != target_profile:
@@ -1363,12 +1665,13 @@ def _cmd_list_impl(refresh=False, target_profile=None):
         backup_dir = f"{BACKUP_PREFIX}_{p}"
         auth_path = os.path.join(backup_dir, "auth.json")
         
+        # 读取用量缓存（含 refresh 写入的 Plan / Subscription Until）
+        usage_data = usage_cache.get(p, {})
         email = "Unknown"
-        plan = "Unknown"
-        until = "Unknown"
+        plan, until = _resolve_plan_and_until(auth_path, usage_data)
         is_active = (p == current)
         
-        # 本地解析 JWT 凭证
+        # 本地解析 JWT 邮箱（Plan/Until 已由 _resolve_plan_and_until 处理）
         if os.path.exists(auth_path):
             try:
                 with open(auth_path, 'r') as f:
@@ -1378,16 +1681,9 @@ def _cmd_list_impl(refresh=False, target_profile=None):
                     payload = decode_jwt_payload(id_token)
                     if payload:
                         email = payload.get("email", "Unknown")
-                        auth_sec = payload.get("https://api.openai.com/auth", {})
-                        plan = auth_sec.get("chatgpt_plan_type", "free").upper()
-                        until_raw = auth_sec.get("chatgpt_subscription_active_until", "Unknown")
-                        if until_raw != "Unknown":
-                            until = until_raw.split('T')[0]
             except Exception:
                 pass
                 
-        # 读取用量缓存
-        usage_data = usage_cache.get(p, {})
         limits = usage_data.get("limits", {})
         limits_status = limits.get("status", "No Data")
         
@@ -1433,28 +1729,29 @@ def _cmd_list_impl(refresh=False, target_profile=None):
             auth_status = limits.get("heartbeat_status")  # 兼容旧缓存
         if auth_status and auth_status != "OK":
             quota_str += f" | {YELLOW}OAuth 告警: {auth_status}{RESET}"
+
+        subscription_status = limits.get("subscription_status")
+        if subscription_status and subscription_status != "OK" and limits_status == "OK":
+            quota_str += f" | {YELLOW}订阅现查失败: {subscription_status}{RESET}"
                 
-        # 纯文本对齐，避免 ANSI 导致排版崩塌
-        active_val = "* ACTIVE" if is_active else ""
-        p_val = p
-        email_val = email
-        plan_val = plan
-        until_val = until
-        quota_val = quota_str  # quota_str 放在最后，即使带颜色也不会影响前面对齐
-        
-        # 组装行
-        line = f"{active_val:<{col_active}}{p_val:<{col_profile}}{email_val:<{col_email}}{plan_val:<{col_plan}}{until_val:<{col_until}}{quota_val}"
-        
-        # 对活动账号标志进行着色
-        if "* ACTIVE" in line:
-            line = line.replace("* ACTIVE", f"{GREEN}* ACTIVE{RESET}")
-            
+        # 按显示宽度填充前几列；Quota 放最后，可含 ANSI 颜色
+        active_val = _pad_display("* ACTIVE" if is_active else "", col_active)
+        if is_active:
+            active_val = active_val.replace("* ACTIVE", f"{GREEN}* ACTIVE{RESET}")
+        line = (
+            active_val
+            + _pad_display(p, col_profile)
+            + _pad_display(email, col_email)
+            + _pad_display(plan, col_plan)
+            + _pad_display(until, col_until)
+            + quota_str
+        )
         print(line)
         
-    print("-" * 135)
+    print("-" * table_width)
     if not refresh:
-        print(f"提示: 以上额度用量基于缓存展示。运行 {BOLD}python3 codex_mgr.py list --refresh{RESET} 可静默现查最新额度。")
-    print(f"提示: 后台守护服务每半小时会自动保活并刷新用量缓存。")
+        print(f"提示: 以上额度与订阅基于缓存展示。运行 {BOLD}python3 codex_mgr.py list --refresh{RESET} 可静默现查最新额度与订阅。")
+    print(f"提示: 后台守护服务每半小时会自动保活并刷新用量与订阅缓存。")
 
 
 def cmd_list(refresh=False, target_profile=None):
@@ -1540,8 +1837,10 @@ def _pretty_status_desc(status):
         return "Token Expired (Session已失效/在其他设备被踢，需重新登录)"
     if status == "Network Timeout":
         return "Network Timeout (接口请求超时，请检查您的代理/节点速度)"
-    if status == "Fetch Timeout":
-        return "Fetch Timeout (用量接口在 20 秒内未返回)"
+    if status == "Fetch Timeout: SSL handshake":
+        return "Fetch Timeout: SSL handshake (到 chatgpt.com 的 TLS 握手失败，多为当前 VPN/节点路由问题)"
+    if status == "Fetch Timeout" or status.startswith("Fetch Timeout:"):
+        return f"{status} (用量接口超时未返回，请检查代理/节点)"
     if status.startswith("Browser Startup Timeout"):
         return f"浏览器启动超时 ({status})"
     if status.startswith("Page Load Timeout"):
@@ -1857,7 +2156,7 @@ ChatGPT/Codex 多账号管理器 CLI
 
 可用命令:
   list              列出所有账号 Profile 及其订阅到期日、用量限额 (读取本地缓存)
-  list --refresh    静默现查所有账号的限额与额度 (不打扰当前客户端，不弹窗)
+  list --refresh    静默现查所有账号的限额、额度与订阅到期 (不打扰当前客户端，不弹窗)
   add <name>        将您当前的登录态备份另存为一个全新的 Profile 账号
   switch <name>     一键备份当前账号，无缝切换到目标账号并重新打开客户端
   switch new        准备一个干净的“未登录”客户端环境以供登录并录入新账号
