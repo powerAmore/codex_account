@@ -19,17 +19,9 @@ import urllib.error
 # 安装缺失的 websocket-client 依赖
 try:
     import websocket
+    HAS_WEBSOCKET = True
 except ImportError:
-    print("正在安装必要依赖 websocket-client...")
-    try:
-        subprocess.run(["uv", "pip", "install", "websocket-client"], check=True, capture_output=True)
-    except Exception:
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "websocket-client"], check=True, capture_output=True)
-        except Exception as e:
-            print(f"安装依赖失败，请手动运行 'pip install websocket-client': {e}")
-            sys.exit(1)
-    import websocket
+    HAS_WEBSOCKET = False
 
 # 配置路径
 APP_SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/Codex")
@@ -1645,7 +1637,7 @@ def _cmd_list_impl(refresh=False, target_profile=None):
     col_plan = 8
     # 最长示例: "2026-08-01 宽限08-04" 显示宽度 20
     col_until = 22
-    table_width = col_active + col_profile + col_email + col_plan + col_until + 28
+    table_width = col_active + col_profile + col_email + col_plan + col_until + 45
     
     header = (
         _pad_display("Active", col_active)
@@ -1811,12 +1803,8 @@ def format_rate_limit(rl, use_color=True):
         if r_ts:
             try:
                 dt = datetime.datetime.fromtimestamp(r_ts)
-                # 如果是短期窗口（小于1天），用 12 小时制显示时间 (如 5:52 PM)
-                if window_seconds < 86400:
-                    r_str = " " + dt.strftime("%I:%M %p").lstrip('0')
-                else:
-                    # 长期窗口（大于等于1天），用月日显示 (如 Jul 20)
-                    r_str = " " + dt.strftime("%b %d")
+                # 精确显示到月日、时:分:秒 (按照系统本地时区)
+                r_str = " " + dt.strftime("%b %d %H:%M:%S")
             except Exception:
                 pass
                 
