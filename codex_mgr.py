@@ -1673,8 +1673,9 @@ def _query_quota_once(profile_name, probe_oauth=True, include_subscription=True)
             "probe_skipped": True,
         }
     combined = _combine_quota_and_oauth_result(direct_result, oauth_result)
-    # 守护轮询不需要每次查询订阅；手动 refresh 才查询，降低请求频率。
-    if include_subscription and direct_result.get("status") == "OK":
+    # 守护轮询也查询订阅：2 小时的周期下，订阅状态应与额度缓存同步。
+    # 即便额度端点被边缘节点拦截，订阅端点仍可能给出有效结果。
+    if include_subscription:
         subscription_result = _query_subscription_with_token(access_token, account_id)
     else:
         subscription_result = {"status": "Skipped"}
@@ -1952,7 +1953,9 @@ def _cmd_list_impl(refresh=False, target_profile=None):
             quota_str += f" | {YELLOW}OAuth 告警: {auth_status}{RESET}"
 
         subscription_status = limits.get("subscription_status")
-        if subscription_status and subscription_status != "OK" and limits_status == "OK":
+        if subscription_status == "Skipped" and limits_status == "OK":
+            quota_str += f" | {YELLOW}订阅本轮未查询（旧缓存）{RESET}"
+        elif subscription_status and subscription_status != "OK" and limits_status == "OK":
             quota_str += f" | {YELLOW}订阅现查失败: {subscription_status}{RESET}"
                 
         # 按显示宽度填充前几列；Quota 放最后，可含 ANSI 颜色
@@ -2174,7 +2177,7 @@ def _cmd_wakeup_impl():
         active_info = silent_query_quota(
             current_active,
             probe_oauth=False,
-            include_subscription=False,
+            include_subscription=True,
         )
         status = active_info.get("status", "Unknown")
         ok = _is_query_ok(active_info)
@@ -2193,8 +2196,8 @@ def _cmd_wakeup_impl():
     # ── 后台账号 ──────────────────────────────────────────────────
     for i, p in enumerate(background_profiles, 1):
         print(f"[后台 {i}/{len(background_profiles)}] {p}")
-        print(f"  · HTTPS 校验 / 按需续签 .... 进行中")
-        info = silent_query_quota(p, probe_oauth=True, include_subscription=False)
+        print(f"  · HTTPS/订阅校验 / 按需续签 进行中")
+        info = silent_query_quota(p, probe_oauth=True, include_subscription=True)
         status = info.get("status", "Unknown")
         ok = _is_query_ok(info)
         detail = status
@@ -2202,7 +2205,7 @@ def _cmd_wakeup_impl():
             detail = f"OK ({format_rate_limit(info.get('rate_limit'), use_color=False)})"
         elif status == "OK" and info.get("auth_status") != "OK":
             detail = f"OAuth Error: {info.get('auth_status', 'Unknown')}"
-        print(f"  · HTTPS 校验 / 按需续签 .... {_log_status(ok, detail)}")
+        print(f"  · HTTPS/订阅校验 / 按需续签 {_log_status(ok, detail)}")
         if info.get("auth_status") != "OK":
             print(f"  · OAuth 保活告警 ............ {info.get('auth_status', 'Unknown')}")
         _check_token_status(p, info, revoked_accounts)
@@ -2351,7 +2354,7 @@ def cmd_daemon():
     print(f"  PID: {os.getpid()}")
     print(f"  周期: 每 {interval_min} 分钟执行一轮")
     print(f"  网络: {get_network_mode()} ({NETWORK_MODE_ENV})")
-    print("  动作: 前台同步备份+HTTPS校验 | 后台HTTPS校验+按需OAuth续签")
+    print("  动作: 前台同步备份+HTTPS/订阅校验 | 后台HTTPS/订阅校验+按需OAuth续签")
     print("=" * 60)
 
     next_run = time.monotonic()

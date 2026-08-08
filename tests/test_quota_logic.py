@@ -651,6 +651,33 @@ class ProbeSchedulingTests(unittest.TestCase):
         self.assertEqual(result["status"], "OK")
         oauth_probe.assert_not_called()
 
+    def test_subscription_is_queried_when_quota_endpoint_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = os.path.join(temp_dir, "Profile")
+            profile_dir = prefix + "_test"
+            os.makedirs(profile_dir)
+            pathlib.Path(profile_dir, "auth.json").write_text(json.dumps({
+                "tokens": {"account_id": "acct-1", "access_token": "token"},
+            }))
+            with (
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch(
+                    "codex_mgr._query_quota_with_token",
+                    return_value={"status": "Blocked by Cloudflare"},
+                ),
+                mock.patch(
+                    "codex_mgr._query_subscription_with_token",
+                    return_value={"status": "OK", "plan_type": "plus"},
+                ) as subscription_query,
+            ):
+                result = codex_mgr._query_quota_once(
+                    "test", probe_oauth=False, include_subscription=True
+                )
+
+        self.assertEqual(result["status"], "Blocked by Cloudflare")
+        self.assertEqual(result["subscription_status"], "OK")
+        subscription_query.assert_called_once_with("token", "acct-1")
+
     def test_active_profile_never_refreshes_copied_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             prefix = os.path.join(temp_dir, "Profile")
