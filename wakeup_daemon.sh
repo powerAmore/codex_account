@@ -4,12 +4,13 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MGR_SCRIPT="${SCRIPT_DIR}/codex_mgr.py"
 LOG_FILE="${SCRIPT_DIR}/daemon.log"
-CODEX_HOME="${HOME}/.codex"
-PID_FILE="${CODEX_HOME}/codex_mgr_daemon.pid"
-CAFFEINATE_PID_FILE="${CODEX_HOME}/codex_mgr_caffeinate.pid"
+CODEX_DATA_DIR="${HOME}/.codex"
+PID_FILE="${CODEX_DATA_DIR}/codex_mgr_daemon.pid"
+CAFFEINATE_PID_FILE="${CODEX_DATA_DIR}/codex_mgr_caffeinate.pid"
 # 当前机器使用 TUN：忽略 HTTP(S)_PROXY，避免应用层二次代理。
 # 若关闭 TUN、改用传统本地代理，可在启动前设置 CODEX_MGR_NETWORK_MODE=env。
 NETWORK_MODE="${CODEX_MGR_NETWORK_MODE:-tun}"
+DAEMON_INTERVAL_MINUTES="${CODEX_MGR_DAEMON_INTERVAL_MINUTES:-120}"
 umask 077
 
 get_pid() {
@@ -48,14 +49,14 @@ start_daemon() {
     fi
     
     echo "正在启动 Codex 账号管理守护进程..."
-    mkdir -p "${CODEX_HOME}"
+    mkdir -p "${CODEX_DATA_DIR}"
 
     # 简单日志轮转，避免常驻服务无限增长。
     if [ -f "${LOG_FILE}" ] && [ "$(stat -f%z "${LOG_FILE}" 2>/dev/null || echo 0)" -gt 5242880 ]; then
         mv -f "${LOG_FILE}" "${LOG_FILE}.1"
     fi
 
-    CODEX_MGR_NETWORK_MODE="${NETWORK_MODE}" nohup python3 -u "${MGR_SCRIPT}" daemon < /dev/null >> "${LOG_FILE}" 2>&1 &
+    CODEX_MGR_NETWORK_MODE="${NETWORK_MODE}" CODEX_MGR_DAEMON_INTERVAL_MINUTES="${DAEMON_INTERVAL_MINUTES}" nohup python3 -u "${MGR_SCRIPT}" daemon < /dev/null >> "${LOG_FILE}" 2>&1 &
     START_PID=$!
 
     # 等待 Python 持有单例锁并原子写入真实 PID 文件。
@@ -71,7 +72,7 @@ start_daemon() {
         echo "守护进程启动成功！"
         echo "  - PID: ${PID}"
         echo "  - 日志文件: ${LOG_FILE}"
-        echo "  - 保活周期: 每半小时自动批量唤醒并更新限额缓存"
+        echo "  - 保活周期: 约每 ${DAEMON_INTERVAL_MINUTES} 分钟自动校验（含随机抖动）"
         echo "  - 网络模式: ${NETWORK_MODE}"
     else
         kill "${START_PID}" 2>/dev/null || true
@@ -113,7 +114,7 @@ check_status() {
     if [ -n "$PID" ]; then
         echo "● Codex 守护进程状态: 正在运行"
         echo "  - PID: ${PID}"
-        echo "  - 运行周期: 每半小时"
+        echo "  - 运行周期: 约每 ${DAEMON_INTERVAL_MINUTES} 分钟"
         echo "  - 日志文件: ${LOG_FILE}"
         echo ""
         echo "最近一轮保活日志（末尾 40 行）:"

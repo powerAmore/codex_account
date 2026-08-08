@@ -63,8 +63,21 @@ class QuotaParsingTests(unittest.TestCase):
         forbidden = codex_mgr._parse_quota_fetch_result(
             {"kind": "http", "status": 403, "body": "challenge"}
         )
-        self.assertEqual(unauthorized["status"], "Token Expired")
+        self.assertEqual(unauthorized["status"], "Token Rejected")
+        self.assertTrue(unauthorized["auth_failure_confirmed"])
         self.assertEqual(forbidden["status"], "Blocked by Cloudflare")
+
+    def test_html_401_is_not_misreported_as_expired_token(self):
+        result = codex_mgr._parse_quota_fetch_result(
+            {
+                "kind": "http",
+                "status": 401,
+                "content_type": "text/html; charset=UTF-8",
+                "body": "<!doctype html><title>Just a moment...</title>",
+            }
+        )
+        self.assertEqual(result["status"], "Blocked by Cloudflare")
+        self.assertNotIn("auth_failure_confirmed", result)
 
     def test_cdp_request_ignores_events(self):
         ws = FakeWebSocket(
@@ -128,6 +141,82 @@ class QuotaParsingTests(unittest.TestCase):
         self.assertTrue(result["quota_fallback_used"])
         self.assertEqual(result["quota_endpoints_tried"], ["codex/usage", "wham/usage"])
 
+    def test_bearer_query_falls_back_from_single_endpoint_401(self):
+        class FakeResponse:
+            status = 200
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"rate_limit": {"primary_window": {}}}).encode()
+
+        rejected = urllib.error.HTTPError(
+            "https://chatgpt.com/backend-api/codex/usage",
+            401,
+            "Unauthorized",
+            {"content-type": "application/json"},
+            io.BytesIO(b'{"detail":"Unauthorized"}'),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = [rejected, FakeResponse()]
+        with mock.patch("codex_mgr._url_opener_for_network_mode", return_value=opener):
+            result = codex_mgr._query_quota_with_token("test-token")
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["quota_endpoint"], "wham/usage")
+
+    def test_mixed_401_and_cloudflare_is_inconclusive(self):
+        rejected = urllib.error.HTTPError(
+            "https://chatgpt.com/backend-api/codex/usage",
+            401,
+            "Unauthorized",
+            {"content-type": "application/json"},
+            io.BytesIO(b'{"detail":"Unauthorized"}'),
+        )
+        blocked = urllib.error.HTTPError(
+            "https://chatgpt.com/backend-api/wham/usage",
+            403,
+            "Forbidden",
+            {"content-type": "text/html", "cf-ray": "test-ray"},
+            io.BytesIO(b"<!doctype html><title>challenge</title>"),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = [rejected, blocked]
+        with mock.patch("codex_mgr._url_opener_for_network_mode", return_value=opener):
+            result = codex_mgr._query_quota_with_token("test-token")
+
+        self.assertTrue(result["status"].startswith("Auth Check Inconclusive"))
+        self.assertFalse(result["auth_failure_confirmed"])
+
+    def test_two_structured_401_responses_confirm_token_rejection(self):
+        def rejected(url):
+            return urllib.error.HTTPError(
+                url,
+                401,
+                "Unauthorized",
+                {"content-type": "application/json"},
+                io.BytesIO(b'{"detail":"Unauthorized"}'),
+            )
+
+        opener = mock.Mock()
+        opener.open.side_effect = [
+            rejected("https://chatgpt.com/backend-api/codex/usage"),
+            rejected("https://chatgpt.com/backend-api/wham/usage"),
+        ]
+        with mock.patch("codex_mgr._url_opener_for_network_mode", return_value=opener):
+            result = codex_mgr._query_quota_with_token("test-token")
+
+        self.assertEqual(result["status"], "Token Rejected")
+        self.assertTrue(result["auth_failure_confirmed"])
+        self.assertEqual(
+            result["quota_endpoint_statuses"], ["Token Rejected", "Token Rejected"]
+        )
+
     def test_tun_mode_disables_application_proxy(self):
         with mock.patch.dict(os.environ, {"CODEX_MGR_NETWORK_MODE": "tun"}):
             self.assertEqual(codex_mgr.get_network_mode(), "tun")
@@ -162,6 +251,18 @@ class QuotaParsingTests(unittest.TestCase):
         self.assertEqual(result["status"], "OK")
         self.assertEqual(result["auth_status"], "OK")
         self.assertEqual(result["attempts"], 2)
+
+    def test_token_rejection_requires_two_confirmations(self):
+        rejected = {
+            "status": "Token Rejected",
+            "auth_status": "OAuth Network Error: websocket failed",
+            "auth_failure_confirmed": True,
+        }
+        with mock.patch("codex_mgr._query_quota_once", side_effect=lambda *_args, **_kwargs: dict(rejected)):
+            once = codex_mgr.silent_query_quota("profile", max_attempts=1)
+            twice = codex_mgr.silent_query_quota("profile", max_attempts=2)
+        self.assertFalse(once["auth_failure_confirmed"])
+        self.assertTrue(twice["auth_failure_confirmed"])
 
     def test_quota_success_with_oauth_network_warning_is_usable(self):
         info = {
@@ -401,8 +502,212 @@ class OAuthProbeTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "OK")
 
+    def test_websocket_warning_still_promotes_rotated_credentials(self):
+        report = {
+            "checks": {
+                "auth.credentials": {"status": "ok", "summary": "auth configured"},
+                "network.websocket_reachability": {
+                    "status": "warning",
+                    "summary": "Responses WebSocket failed",
+                },
+            },
+        }
+
+        def run_doctor(*_args, **kwargs):
+            temp_auth = pathlib.Path(kwargs["env"]["CODEX_HOME"], "auth.json")
+            auth = json.loads(temp_auth.read_text())
+            auth["last_refresh"] = "2026-08-08T10:00:00Z"
+            auth["tokens"]["refresh_token"] = "rotated"
+            temp_auth.write_text(json.dumps(auth))
+            return mock.Mock(returncode=1, stdout=json.dumps(report), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = os.path.join(temp_dir, "Profile")
+            profile_dir = prefix + "_test"
+            os.makedirs(profile_dir)
+            auth_path = pathlib.Path(profile_dir, "auth.json")
+            auth_path.write_text(json.dumps({
+                "last_refresh": "2026-08-07T10:00:00Z",
+                "tokens": {
+                    "account_id": "acct-1",
+                    "access_token": "token",
+                    "refresh_token": "old",
+                },
+            }))
+            with (
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr.CODEX_CLI_PATH", "/usr/bin/true"),
+                mock.patch("codex_mgr.subprocess.run", side_effect=run_doctor),
+            ):
+                result = codex_mgr._probe_codex_oauth("test")
+
+            saved = json.loads(auth_path.read_text())
+        self.assertTrue(result["credentials_refreshed"])
+        self.assertTrue(result["status"].startswith("OAuth Network Error"))
+        self.assertEqual(saved["tokens"]["refresh_token"], "rotated")
+
+
+class CredentialSyncTests(unittest.TestCase):
+    def test_older_snapshot_cannot_overwrite_newer_credentials(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = pathlib.Path(temp_dir, "source.json")
+            target = pathlib.Path(temp_dir, "target.json")
+            source.write_text(json.dumps({
+                "last_refresh": "2026-08-01T00:00:00Z",
+                "tokens": {"account_id": "acct-1", "refresh_token": "old"},
+            }))
+            target.write_text(json.dumps({
+                "last_refresh": "2026-08-02T00:00:00Z",
+                "tokens": {"account_id": "acct-1", "refresh_token": "new"},
+            }))
+            ok, action = codex_mgr._sync_auth_snapshot(str(source), str(target))
+            saved = json.loads(target.read_text())
+        self.assertTrue(ok)
+        self.assertEqual(action, "destination-newer")
+        self.assertEqual(saved["tokens"]["refresh_token"], "new")
+
+    def test_different_account_cannot_overwrite_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = pathlib.Path(temp_dir, "source.json")
+            target = pathlib.Path(temp_dir, "target.json")
+            source.write_text(json.dumps({"tokens": {"account_id": "acct-a"}}))
+            target.write_text(json.dumps({"tokens": {"account_id": "acct-b"}}))
+            ok, action = codex_mgr._sync_auth_snapshot(str(source), str(target))
+        self.assertFalse(ok)
+        self.assertEqual(action, "identity-mismatch")
+
+
+class ProfileNamingTests(unittest.TestCase):
+    def test_add_new_uses_detected_name_instead_of_literal_new(self):
+        def jwt(payload):
+            import base64
+            encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+            return f"header.{encoded}.signature"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            auth_file = os.path.join(temp_dir, "auth.json")
+            pathlib.Path(auth_file).write_text(json.dumps({
+                "tokens": {"id_token": jwt({"name": "Jane Doe", "email": "new@example.com"})},
+            }))
+            prefix = os.path.join(temp_dir, "Profile")
+            with (
+                mock.patch("codex_mgr.AUTH_FILE", auth_file),
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr.get_profiles", return_value=[]),
+                mock.patch("codex_mgr.get_current_active", return_value=None),
+                mock.patch("codex_mgr.kill_chatgpt_processes"),
+                mock.patch("codex_mgr.backup_profile", return_value=True) as backup,
+                mock.patch("codex_mgr.set_current_active") as set_active,
+                mock.patch("codex_mgr.subprocess.run"),
+            ):
+                codex_mgr.cmd_add("new")
+
+        self.assertEqual(backup.call_args_list[-1].args[0], "Jane_Doe")
+        set_active.assert_called_once_with("Jane_Doe")
+
+    def test_rename_moves_profile_cache_and_active_marker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = os.path.join(temp_dir, "Profile")
+            source = prefix + "_new"
+            target = prefix + "_Jane_Doe"
+            os.makedirs(source)
+            cache_file = os.path.join(temp_dir, "usage.json")
+            active_file = os.path.join(temp_dir, "active")
+            pathlib.Path(cache_file).write_text(json.dumps({"new": {"limits": {"status": "OK"}}}))
+            pathlib.Path(active_file).write_text("new")
+            with (
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr.USAGE_CACHE_FILE", cache_file),
+                mock.patch("codex_mgr.ACTIVE_FILE", active_file),
+            ):
+                renamed = codex_mgr.cmd_rename("new", "Jane_Doe")
+            cache = json.loads(pathlib.Path(cache_file).read_text())
+            target_exists = os.path.isdir(target)
+            active_value = pathlib.Path(active_file).read_text()
+
+        self.assertTrue(renamed)
+        self.assertTrue(target_exists)
+        self.assertIn("Jane_Doe", cache)
+        self.assertNotIn("new", cache)
+        self.assertEqual(active_value, "Jane_Doe")
+
+
+class ProbeSchedulingTests(unittest.TestCase):
+    def test_healthy_far_from_expiry_skips_oauth_probe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = os.path.join(temp_dir, "Profile")
+            profile_dir = prefix + "_test"
+            os.makedirs(profile_dir)
+            pathlib.Path(profile_dir, "auth.json").write_text(json.dumps({
+                "tokens": {"account_id": "acct-1", "access_token": "token"},
+            }))
+            with (
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr._query_quota_with_token", return_value={"status": "OK", "rate_limit": {}}),
+                mock.patch("codex_mgr._access_token_needs_refresh", return_value=False),
+                mock.patch("codex_mgr._probe_codex_oauth") as oauth_probe,
+            ):
+                result = codex_mgr._query_quota_once("test", include_subscription=False)
+        self.assertEqual(result["status"], "OK")
+        oauth_probe.assert_not_called()
+
+    def test_active_profile_never_refreshes_copied_credentials(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = os.path.join(temp_dir, "Profile")
+            profile_dir = prefix + "_test"
+            os.makedirs(profile_dir)
+            pathlib.Path(profile_dir, "auth.json").write_text(json.dumps({
+                "tokens": {"account_id": "acct-1", "access_token": "token"},
+            }))
+            with (
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr._query_quota_with_token", return_value={
+                    "status": "Token Rejected",
+                    "auth_failure_confirmed": True,
+                }),
+                mock.patch("codex_mgr._probe_codex_oauth") as oauth_probe,
+            ):
+                result = codex_mgr._query_quota_once(
+                    "test",
+                    probe_oauth=False,
+                    include_subscription=False,
+                )
+        self.assertEqual(result["status"], "Token Rejected")
+        oauth_probe.assert_not_called()
+
 
 class StatePromotionTests(unittest.TestCase):
+    def test_restore_removes_previous_accounts_storage_and_cookie_sidecars(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = os.path.join(temp_dir, "Codex")
+            default_dir = os.path.join(app_dir, "Default")
+            prefix = os.path.join(temp_dir, "Profile")
+            backup_dir = prefix + "_target"
+            backup_default = os.path.join(backup_dir, "app_support", "Default")
+            auth_file = os.path.join(temp_dir, ".codex", "auth.json")
+            active_file = os.path.join(temp_dir, "active")
+            os.makedirs(os.path.join(default_dir, "Local Storage"))
+            os.makedirs(os.path.join(default_dir, "Session Storage"))
+            pathlib.Path(default_dir, "Cookies-wal").write_text("stale")
+            pathlib.Path(default_dir, "Cookies-shm").write_text("stale")
+            os.makedirs(backup_default)
+            pathlib.Path(backup_dir, "auth.json").write_text(json.dumps({
+                "tokens": {"account_id": "acct-target"},
+            }))
+            with (
+                mock.patch("codex_mgr.APP_SUPPORT_DIR", app_dir),
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr.AUTH_FILE", auth_file),
+                mock.patch("codex_mgr.ACTIVE_FILE", active_file),
+            ):
+                restored = codex_mgr.restore_profile("target")
+
+            self.assertTrue(restored)
+            self.assertFalse(os.path.exists(os.path.join(default_dir, "Local Storage")))
+            self.assertFalse(os.path.exists(os.path.join(default_dir, "Session Storage")))
+            self.assertFalse(os.path.exists(os.path.join(default_dir, "Cookies-wal")))
+            self.assertFalse(os.path.exists(os.path.join(default_dir, "Cookies-shm")))
+
     def test_valid_cookie_snapshot_is_promoted_with_rollback_copy(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = os.path.join(temp_dir, "source")

@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 import datetime
+import random
 import unicodedata
 import urllib.request
 import urllib.error
@@ -42,6 +43,9 @@ _DAEMON_LOCK_FD = None
 # 应用层二次代理。需要传统 HTTP/SOCKS 代理时可显式设置为 env。
 NETWORK_MODE_ENV = "CODEX_MGR_NETWORK_MODE"
 DEFAULT_NETWORK_MODE = "tun"
+DAEMON_INTERVAL_ENV = "CODEX_MGR_DAEMON_INTERVAL_MINUTES"
+DEFAULT_DAEMON_INTERVAL_MINUTES = 120
+OAUTH_REFRESH_MARGIN_SECONDS = 48 * 3600
 
 # 颜色控制
 GREEN = '\033[92m'
@@ -149,6 +153,66 @@ def decode_jwt_payload(token):
         return json.loads(decoded)
     except Exception:
         return None
+
+
+def _auth_account_id(auth_data):
+    return str(((auth_data or {}).get("tokens") or {}).get("account_id") or "")
+
+
+def _auth_generation(auth_data):
+    """返回凭据的新旧代际；用于防止旧快照覆盖已轮换的新凭据。"""
+    values = []
+    for token_name in ("access_token", "id_token"):
+        payload = decode_jwt_payload(((auth_data or {}).get("tokens") or {}).get(token_name, ""))
+        if isinstance(payload, dict):
+            for field in ("iat", "exp"):
+                try:
+                    values.append(float(payload.get(field) or 0))
+                except (TypeError, ValueError):
+                    pass
+    last_refresh = str((auth_data or {}).get("last_refresh") or "").strip()
+    if last_refresh:
+        try:
+            parsed = datetime.datetime.fromisoformat(last_refresh.replace("Z", "+00:00"))
+            values.append(parsed.timestamp())
+        except (TypeError, ValueError):
+            pass
+    return max(values or [0])
+
+
+def _read_auth_json(path):
+    with open(path, "r") as auth_file:
+        data = json.load(auth_file)
+    if not isinstance(data, dict):
+        raise ValueError("auth.json root must be an object")
+    return data
+
+
+def _sync_auth_snapshot(src, dst):
+    """同账号凭据只向前同步。返回 (ok, action)。"""
+    source = _read_auth_json(src)
+    source_account = _auth_account_id(source)
+    if os.path.exists(dst):
+        target = _read_auth_json(dst)
+        target_account = _auth_account_id(target)
+        if source_account and target_account and source_account != target_account:
+            return False, "identity-mismatch"
+        if _auth_generation(target) > _auth_generation(source):
+            return True, "destination-newer"
+    _atomic_copy_file(src, dst, mode=0o600)
+    return True, "copied"
+
+
+def _access_token_needs_refresh(auth_data, now=None, margin=OAUTH_REFRESH_MARGIN_SECONDS):
+    token = ((auth_data or {}).get("tokens") or {}).get("access_token", "")
+    payload = decode_jwt_payload(token)
+    try:
+        expires_at = float((payload or {}).get("exp") or 0)
+    except (TypeError, ValueError):
+        return True
+    if not expires_at:
+        return True
+    return expires_at - (time.time() if now is None else now) <= margin
 
 def kill_chatgpt_processes():
     print("正在安全关闭 ChatGPT / Codex 进程...")
@@ -260,6 +324,22 @@ def backup_profile(profile_name, quiet=False):
 
     success = True
 
+    # active 标记可能因手工登录/崩溃而滞后。身份不一致时必须在复制 Cookie 前中止，
+    # 否则守护进程会把 A 账号的登录态覆盖进 B Profile。
+    backup_auth = os.path.join(backup_dir, "auth.json")
+    if os.path.exists(AUTH_FILE) and os.path.exists(backup_auth):
+        try:
+            live_account = _auth_account_id(_read_auth_json(AUTH_FILE))
+            saved_account = _auth_account_id(_read_auth_json(backup_auth))
+            if live_account and saved_account and live_account != saved_account:
+                if not quiet:
+                    print(f"[{RED}ERROR{RESET}] 活跃账号身份与 Profile '{profile_name}' 不一致，已拒绝覆盖备份。")
+                return False
+        except Exception as e:
+            if not quiet:
+                print(f"[{RED}ERROR{RESET}] 校验 auth.json 身份失败: {e}")
+            return False
+
     # 备份 App Support 核心文件
     app_support_backup = os.path.join(backup_dir, "app_support", "Default")
     os.makedirs(app_support_backup, exist_ok=True)
@@ -276,9 +356,10 @@ def backup_profile(profile_name, quiet=False):
                     cookies_src,
                     os.path.join(app_support_backup, "Cookies"),
                 )
-                stale_journal = os.path.join(app_support_backup, "Cookies-journal")
-                if os.path.exists(stale_journal):
-                    os.remove(stale_journal)
+                for sidecar in ("Cookies-journal", "Cookies-wal", "Cookies-shm"):
+                    stale_sidecar = os.path.join(app_support_backup, sidecar)
+                    if os.path.exists(stale_sidecar):
+                        os.remove(stale_sidecar)
             except Exception as e:
                 if not quiet:
                     print(f"[{RED}ERROR{RESET}] Cookies 一致性快照失败: {e}")
@@ -299,7 +380,11 @@ def backup_profile(profile_name, quiet=False):
     # 备份 auth.json
     if os.path.exists(AUTH_FILE):
         try:
-            _atomic_copy_file(AUTH_FILE, os.path.join(backup_dir, "auth.json"), mode=0o600)
+            auth_ok, auth_action = _sync_auth_snapshot(AUTH_FILE, backup_auth)
+            if not auth_ok:
+                raise RuntimeError(auth_action)
+            if auth_action == "destination-newer" and not quiet:
+                print("检测到 Profile 中的凭据更新，已保留较新版本，避免旧令牌回滚。")
         except Exception as e:
             if not quiet:
                 print(f"[{RED}ERROR{RESET}] 备份 auth.json 失败: {e}")
@@ -320,17 +405,17 @@ def restore_profile(profile_name):
     
     app_support_backup = os.path.join(backup_dir, "app_support", "Default")
     if os.path.exists(app_support_backup):
-        # 还原核心认证文件
-        for item in ["Cookies", "Cookies-journal"]:
-            src = os.path.join(app_support_backup, item)
-            dst = os.path.join(default_dir, item)
-            if os.path.exists(src):
-                _atomic_copy_file(src, dst, mode=0o600)
-            elif os.path.exists(dst):
-                try:
-                    os.remove(dst)
-                except Exception:
-                    pass
+        # 只还原一致性快照；上一个账号遗留的 SQLite WAL/SHM 必须清除。
+        cookies_src = os.path.join(app_support_backup, "Cookies")
+        cookies_dst = os.path.join(default_dir, "Cookies")
+        if os.path.exists(cookies_src):
+            _atomic_copy_file(cookies_src, cookies_dst, mode=0o600)
+        elif os.path.exists(cookies_dst):
+            os.remove(cookies_dst)
+        for sidecar in ("Cookies-journal", "Cookies-wal", "Cookies-shm"):
+            stale_sidecar = os.path.join(default_dir, sidecar)
+            if os.path.exists(stale_sidecar):
+                os.remove(stale_sidecar)
                     
         # 还原 Local Storage / Session Storage
         for folder in ["Local Storage", "Session Storage"]:
@@ -338,6 +423,8 @@ def restore_profile(profile_name):
             dst_folder = os.path.join(default_dir, folder)
             if os.path.exists(src_folder):
                 _replace_directory_copy(src_folder, dst_folder)
+            elif os.path.exists(dst_folder):
+                shutil.rmtree(dst_folder)
                 
     # 还原 auth.json
     backup_auth = os.path.join(backup_dir, "auth.json")
@@ -354,6 +441,12 @@ def restore_profile(profile_name):
     return True
 
 def cmd_add(profile_name=None):
+    # ``switch new`` 的 new 是操作关键字，不是建议作为 Profile 别名。
+    # 容忍用户顺手输入 ``add new``，仍按登录凭据自动命名。
+    if str(profile_name or "").strip().lower() in ("new", "--new"):
+        print("提示: add new 会按当前登录账号自动命名，不会创建名为 'new' 的 Profile。")
+        profile_name = None
+
     # 1. 尝试从当前的 auth.json 自动提取姓名和邮箱
     detected_email = None
     detected_name = None
@@ -435,12 +528,16 @@ def cmd_add(profile_name=None):
     current = get_current_active()
     if current:
         print(f"正在增量备份当前活跃账号 '{current}' 的最新状态...")
-        backup_profile(current)
+        if not backup_profile(current):
+            print(f"{RED}[安全中止] 当前账号备份失败，已取消新增 Profile。{RESET}")
+            return
 
     # 5. 创建新 Profile 目录并备份当前数据
     print(f"正在将当前登录态保存为新 Profile: '{profile_name}'...")
     os.makedirs(backup_dir, exist_ok=True)
-    backup_profile(profile_name)
+    if not backup_profile(profile_name):
+        print(f"{RED}[安全中止] 新 Profile 备份失败，未更新活跃账号标记。{RESET}")
+        return
     set_current_active(profile_name)
     print(f"{GREEN}账号 Profile '{profile_name}' 创建并备份成功！{RESET}")
 
@@ -573,7 +670,9 @@ def cmd_switch(target_profile):
     # 2. 备份当前
     if current:
         print(f"正在增量备份当前账号 '{current}' 的最新状态...")
-        backup_profile(current)
+        if not backup_profile(current):
+            print(f"{RED}[安全中止] 当前账号备份失败，已取消切换，避免登录态丢失或串号。{RESET}")
+            return
         
     # 3. 还原目标
     if restore_profile(target_profile):
@@ -656,6 +755,47 @@ def cmd_del(target_profile):
             pass
 
     print(f"{GREEN}账号 '{target_profile}' 已成功删除！{RESET}")
+
+
+def _is_valid_profile_name(name):
+    valid_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.@")
+    return bool(name) and all(c in valid_chars for c in name)
+
+
+def cmd_rename(source_profile, target_profile):
+    """原子重命名本地 Profile、活跃标记与用量缓存，不触碰服务器凭据。"""
+    source_profile = str(source_profile or "").strip()
+    target_profile = str(target_profile or "").strip()
+    if not _is_valid_profile_name(target_profile):
+        print(f"{RED}错误: 新 Profile 名称只允许英文字母、数字、下划线、连字符、点和 @ 符号。{RESET}")
+        return False
+    if source_profile == target_profile:
+        print("提示: 新旧 Profile 名称相同，无需重命名。")
+        return True
+
+    source_dir = f"{BACKUP_PREFIX}_{source_profile}"
+    target_dir = f"{BACKUP_PREFIX}_{target_profile}"
+    if not os.path.isdir(source_dir):
+        print(f"{RED}错误: Profile '{source_profile}' 不存在。{RESET}")
+        return False
+    if os.path.exists(target_dir):
+        print(f"{RED}错误: Profile '{target_profile}' 已存在，未执行重命名。{RESET}")
+        return False
+
+    try:
+        os.replace(source_dir, target_dir)
+        usage_cache = load_usage_cache()
+        if source_profile in usage_cache:
+            usage_cache[target_profile] = usage_cache.pop(source_profile)
+            save_usage_cache(usage_cache)
+        if get_current_active() == source_profile:
+            set_current_active(target_profile)
+    except Exception as exc:
+        print(f"{RED}错误: 重命名 Profile 失败: {type(exc).__name__}: {exc}{RESET}")
+        return False
+
+    print(f"{GREEN}Profile 已重命名: '{source_profile}' → '{target_profile}'{RESET}")
+    return True
 
 def find_free_port():
     """动态获取一个当前空闲可用的 TCP 端口。"""
@@ -914,9 +1054,29 @@ def _parse_quota_fetch_result(fetch_result):
     http_status = int(fetch_result.get("status") or 0)
     body = fetch_result.get("body")
     body_text = str(body).lower()
+    content_type = str(fetch_result.get("content_type") or "").lower()
+    html_response = "text/html" in content_type or (
+        isinstance(body, str) and body.lstrip().lower().startswith(("<!doctype html", "<html"))
+    )
+    challenge_response = html_response and (
+        "cloudflare" in body_text or "challenge" in body_text or http_status in (401, 403)
+    )
 
+    # Cloudflare/代理边缘有时用 401 返回 HTML challenge。只有结构化 JSON 401
+    # 才能证明 Bearer 被业务服务拒绝，不能再把所有 401 都报成“账号被踢”。
+    if challenge_response:
+        return {"status": "Blocked by Cloudflare", "http_status": http_status}
     if http_status == 401:
-        return {"status": "Token Expired"}
+        if isinstance(body, dict):
+            return {
+                "status": "Token Rejected",
+                "http_status": http_status,
+                # 只有 JSON 401 才是两端点共识判断可用的强证据；其他包含
+                # token 字样的响应可能来自网关、灰度或非标准错误页。
+                "structured_401": True,
+                "auth_failure_confirmed": True,
+            }
+        return {"status": "Auth Check Inconclusive: HTTP 401 non-JSON", "http_status": http_status}
     if http_status == 403:
         return {"status": "Blocked by Cloudflare"}
 
@@ -936,11 +1096,11 @@ def _parse_quota_fetch_result(fetch_result):
                 error_code = str(error_obj).lower()
                 error_message = str(error_obj)
             if any(word in error_code for word in ("token", "invalid", "unauthorized")):
-                return {"status": "Token Expired"}
+                return {"status": "Token Rejected", "auth_failure_confirmed": True}
             return {"status": f"API Error: HTTP {http_status}: {error_message}"}
         if "detail" in body:
             if "unauthorized" in body_text:
-                return {"status": "Token Expired"}
+                return {"status": "Token Rejected", "auth_failure_confirmed": True}
             return {"status": f"API Error: HTTP {http_status}: {body.get('detail')}"}
 
     if http_status >= 400:
@@ -948,7 +1108,7 @@ def _parse_quota_fetch_result(fetch_result):
     if "challenge" in body_text or "cloudflare" in body_text:
         return {"status": "Blocked by Cloudflare"}
     if any(word in body_text for word in ("unauthorized", "token is missing", "token_invalidated")):
-        return {"status": "Token Expired"}
+        return {"status": "Token Rejected", "auth_failure_confirmed": True}
     return {"status": f"Parse Error: HTTP {http_status}: {str(body)[:100]}"}
 
 
@@ -985,6 +1145,8 @@ def _query_quota_with_token(access_token, timeout=15):
     opener = _url_opener_for_network_mode()
     last_result = {"status": "Unknown"}
     tried = []
+    endpoint_statuses = []
+    endpoint_results = []
 
     for endpoint in endpoints:
         endpoint_name = endpoint.split("/backend-api/", 1)[-1]
@@ -997,18 +1159,24 @@ def _query_quota_with_token(access_token, timeout=15):
                     body = json.loads(raw_body)
                 except json.JSONDecodeError:
                     body = raw_body
-                result = _parse_quota_fetch_result(
-                    {"kind": "http", "status": response.status, "body": body}
-                )
+                result = _parse_quota_fetch_result({
+                    "kind": "http",
+                    "status": response.status,
+                    "body": body,
+                    "content_type": getattr(response, "headers", {}).get("content-type", ""),
+                })
         except urllib.error.HTTPError as exc:
             raw_body = exc.read().decode("utf-8", errors="replace")
             try:
                 body = json.loads(raw_body)
             except json.JSONDecodeError:
                 body = raw_body
-            result = _parse_quota_fetch_result(
-                {"kind": "http", "status": exc.code, "body": body}
-            )
+            result = _parse_quota_fetch_result({
+                "kind": "http",
+                "status": exc.code,
+                "body": body,
+                "content_type": exc.headers.get("content-type", ""),
+            })
             # cf-ray 只用于诊断边缘节点，不记录响应正文或任何凭证。
             cf_ray = exc.headers.get("cf-ray")
             if cf_ray:
@@ -1020,6 +1188,8 @@ def _query_quota_with_token(access_token, timeout=15):
 
         result["source"] = "bearer"
         result["quota_endpoint"] = endpoint_name
+        endpoint_statuses.append(str(result.get("status", "Unknown")))
+        endpoint_results.append(result)
         if result.get("status") == "OK":
             if len(tried) > 1:
                 result["quota_fallback_used"] = True
@@ -1027,11 +1197,11 @@ def _query_quota_with_token(access_token, timeout=15):
             return result
 
         last_result = result
-        # 401/Token Expired、解析错误等不应通过另一 URL 掩盖；边缘挑战、
-        # 429/5xx 和网络瞬态才值得切换兼容路径。
+        # 两条兼容路径都返回结构化 401 才形成凭据拒绝共识；单一路径 401
+        # 也要检查另一条，避免把端点灰度/边缘异常误报成账号失效。
         status = str(result.get("status", ""))
         retryable = (
-            status in ("Blocked by Cloudflare", "Fetch Timeout")
+            status in ("Blocked by Cloudflare", "Fetch Timeout", "Token Rejected")
             or status.startswith("Fetch Timeout:")
             or status.startswith("Network Error")
             or status.startswith("API Error: HTTP 429")
@@ -1042,6 +1212,21 @@ def _query_quota_with_token(access_token, timeout=15):
 
     last_result["source"] = "bearer"
     last_result["quota_endpoints_tried"] = tried
+    last_result["quota_endpoint_statuses"] = endpoint_statuses
+    structured_401_count = sum(
+        status == "Token Rejected" and result.get("structured_401")
+        for status, result in zip(endpoint_statuses, endpoint_results)
+    )
+    if structured_401_count and structured_401_count != len(endpoint_statuses):
+        return {
+            "status": "Auth Check Inconclusive: quota endpoints disagree",
+            "source": "bearer",
+            "quota_endpoints_tried": tried,
+            "quota_endpoint_statuses": endpoint_statuses,
+            "auth_failure_confirmed": False,
+        }
+    if structured_401_count == len(endpoint_statuses) and structured_401_count:
+        last_result["auth_failure_confirmed"] = True
     return last_result
 
 
@@ -1350,8 +1535,7 @@ def _probe_codex_oauth(profile_name, timeout=35):
     temp_auth = os.path.join(temp_home, "auth.json")
     try:
         _atomic_copy_file(auth_path, temp_auth, mode=0o600)
-        with open(auth_path, "r") as auth_file:
-            original = json.load(auth_file)
+        original = _read_auth_json(auth_path)
         original_account = str((original.get("tokens") or {}).get("account_id") or "")
 
         completed = subprocess.run(
@@ -1378,14 +1562,11 @@ def _probe_codex_oauth(profile_name, timeout=35):
         if credentials.get("status") != "ok":
             detail = credentials.get("summary") or "credentials check failed"
             return {"status": f"OAuth Credentials Error: {detail}", "source": "codex-doctor"}
-        if websocket_check.get("status") != "ok":
-            detail = websocket_check.get("summary") or "authenticated websocket failed"
-            return {"status": f"OAuth Network Error: {detail}", "source": "codex-doctor"}
 
         # 官方 CLI 可能在 access token 临近/已经过期时轮换 refresh token。
-        # 仅认证成功且账号 ID 未变化时，才原子回写新的凭证。
-        with open(temp_auth, "r") as auth_file:
-            refreshed = json.load(auth_file)
+        # 即使 WebSocket 诊断失败，也要先检查 CLI 是否已安全写入新凭据；旧逻辑
+        # 在 warning 处提前返回，会丢掉已经完成的令牌轮换。
+        refreshed = _read_auth_json(temp_auth)
         refreshed_account = str((refreshed.get("tokens") or {}).get("account_id") or "")
         if original_account and refreshed_account != original_account:
             return {
@@ -1395,7 +1576,21 @@ def _probe_codex_oauth(profile_name, timeout=35):
         with open(auth_path, "rb") as original_file, open(temp_auth, "rb") as refreshed_file:
             changed = original_file.read() != refreshed_file.read()
         if changed:
-            _atomic_copy_file(temp_auth, auth_path, mode=0o600)
+            sync_ok, sync_action = _sync_auth_snapshot(temp_auth, auth_path)
+            if not sync_ok:
+                return {
+                    "status": f"OAuth Credential Promotion Failed: {sync_action}",
+                    "source": "codex-doctor",
+                }
+            changed = sync_action == "copied"
+
+        if websocket_check.get("status") != "ok":
+            detail = websocket_check.get("summary") or "authenticated websocket failed"
+            return {
+                "status": f"OAuth Network Error: {detail}",
+                "source": "codex-doctor",
+                "credentials_refreshed": changed,
+            }
 
         return {
             "status": "OK",
@@ -1437,32 +1632,52 @@ def _combine_quota_and_oauth_result(direct_result, oauth_result):
     return result
 
 
-def _query_quota_once(profile_name):
-    """官方 OAuth 探针 + Bearer 额度/订阅查询；调用方负责瞬态重试。"""
+def _query_quota_once(profile_name, probe_oauth=True, include_subscription=True):
+    """先做低成本 HTTPS 查询；仅在需要续签/恢复时运行 OAuth 探针。"""
     backup_dir = f"{BACKUP_PREFIX}_{profile_name}"
     auth_path = os.path.join(backup_dir, "auth.json")
     if not os.path.exists(auth_path):
         return {"status": "No Auth Data", "auth_status": "No Auth Data"}
 
-    oauth_result = _probe_codex_oauth(profile_name)
     access_token = ""
     account_id = ""
     try:
-        with open(auth_path, "r") as auth_file:
-            auth_data = json.load(auth_file)
+        auth_data = _read_auth_json(auth_path)
         tokens = auth_data.get("tokens") or {}
         access_token = tokens.get("access_token", "")
         account_id = tokens.get("account_id", "")
     except Exception as exc:
         return {
             "status": f"Auth Read Error: {type(exc).__name__}: {exc}",
-            "auth_status": oauth_result.get("status", "Unknown"),
+            "auth_status": "Auth Read Error",
         }
 
     direct_result = _query_quota_with_token(access_token)
+    needs_oauth = probe_oauth and (
+        direct_result.get("status") == "Token Rejected"
+        or (direct_result.get("status") == "OK" and _access_token_needs_refresh(auth_data))
+    )
+    if needs_oauth:
+        oauth_result = _probe_codex_oauth(profile_name)
+        if oauth_result.get("credentials_refreshed"):
+            # 续签成功后必须重新读取并验证新 access token，而不是继续使用旧值。
+            auth_data = _read_auth_json(auth_path)
+            tokens = auth_data.get("tokens") or {}
+            access_token = tokens.get("access_token", "")
+            account_id = tokens.get("account_id", "")
+            direct_result = _query_quota_with_token(access_token)
+    else:
+        oauth_result = {
+            "status": "OK",
+            "source": "active-app" if not probe_oauth else "https",
+            "probe_skipped": True,
+        }
     combined = _combine_quota_and_oauth_result(direct_result, oauth_result)
-    # 订阅元数据失败不影响额度成功；list 会继续回退到本地 JWT。
-    subscription_result = _query_subscription_with_token(access_token, account_id)
+    # 守护轮询不需要每次查询订阅；手动 refresh 才查询，降低请求频率。
+    if include_subscription and direct_result.get("status") == "OK":
+        subscription_result = _query_subscription_with_token(access_token, account_id)
+    else:
+        subscription_result = {"status": "Skipped"}
     return _merge_subscription_into_quota_result(combined, subscription_result)
 
 
@@ -1484,6 +1699,7 @@ def _is_transient_query_status(status):
         "Runtime Error",
         "Parse Error",
         "Blocked by Cloudflare",
+        "Auth Check Inconclusive",
         "Cookie Identity Missing",
         "State Promotion Failed",
         "API Error: HTTP 429",
@@ -1503,12 +1719,16 @@ def _is_hard_auth_failure(status):
     ))
 
 
-def silent_query_quota(profile_name, max_attempts=2):
+def silent_query_quota(profile_name, max_attempts=2, probe_oauth=True, include_subscription=True):
     """额度和官方 OAuth 认证分别判定；任一瞬态失败都会重试。"""
     attempts = []
     for attempt in range(max(1, max_attempts)):
         try:
-            info = _query_quota_once(profile_name)
+            info = _query_quota_once(
+                profile_name,
+                probe_oauth=probe_oauth,
+                include_subscription=include_subscription,
+            )
         except Exception as exc:
             info = {"status": f"Runtime Error: query setup: {type(exc).__name__}: {exc}"}
         status = info.get("status", "Unknown")
@@ -1520,15 +1740,16 @@ def silent_query_quota(profile_name, max_attempts=2):
 
         quota_ok = status == "OK"
         auth_ok = auth_status == "OK" or (quota_ok and not _is_hard_auth_failure(auth_status))
-        fully_expired = status == "Token Expired" and _is_hard_auth_failure(auth_status)
+        hard_rejected = status == "Token Rejected" and _is_hard_auth_failure(auth_status)
         retryable = (
             not quota_ok
             and (
-                _is_transient_query_status(status)
+                status == "Token Rejected"
+                or _is_transient_query_status(status)
                 or (auth_status and _is_transient_query_status(auth_status))
             )
         )
-        if (quota_ok and auth_ok) or fully_expired or not retryable:
+        if (quota_ok and auth_ok) or hard_rejected or not retryable:
             break
         if attempt + 1 < max_attempts:
             time.sleep(0.8 * (attempt + 1))
@@ -1536,6 +1757,14 @@ def silent_query_quota(profile_name, max_attempts=2):
     info["attempts"] = len(attempts)
     if len(attempts) > 1:
         info["attempt_history"] = attempts[:-1]
+    if info.get("status") == "Token Rejected":
+        info["auth_failure_confirmed"] = bool(
+            info.get("auth_failure_confirmed")
+            and (
+                _is_hard_auth_failure(info.get("auth_status"))
+                or (len(attempts) >= 2 and all(item.startswith("Token Rejected") for item in attempts))
+            )
+        )
     return info
 
 def load_usage_cache():
@@ -1609,11 +1838,11 @@ def _cmd_list_impl(refresh=False, target_profile=None):
         # 在现查开始前，如果要刷新的账号里包含当前的 ACTIVE 账号，自动增量备份其最新登录态
         if current and current in to_refresh:
             backup_profile(current, quiet=True)
-        print("正在静默现查指定账号的限额、额度与订阅..." if target_profile else "正在静默现查所有账号的限额、额度与订阅 (官方 OAuth 探针，不打扰当前客户端)...")
+        print("正在静默现查指定账号的限额、额度与订阅..." if target_profile else "正在静默现查所有账号的限额、额度与订阅 (HTTPS 优先，按需 OAuth，不打扰当前客户端)...")
         # 对每一个 profile 现查
         for i, p in enumerate(to_refresh):
             print(f"  [{i+1}/{len(to_refresh)}] 正在查询账号: {p} ...", end="", flush=True)
-            info = silent_query_quota(p)
+            info = silent_query_quota(p, probe_oauth=(p != current))
             _record_usage_result(usage_cache, p, info)
             auth_status = info.get("auth_status")
             if info.get("status") == "OK" and auth_status == "OK":
@@ -1681,8 +1910,8 @@ def _cmd_list_impl(refresh=False, target_profile=None):
         
         # 格式化用量限制展示
         quota_str = ""
-        if limits_status == "Token Expired":
-            quota_str = f"{RED}Token Expired ❌{RESET}"
+        if limits_status in ("Token Expired", "Token Rejected"):
+            quota_str = f"{RED}{limits_status} ❌{RESET}"
         elif limits_status == "Network Timeout":
             quota_str = f"{YELLOW}Network Timeout ⚠️{RESET}"
         elif limits_status == "Blocked by Cloudflare":
@@ -1743,7 +1972,7 @@ def _cmd_list_impl(refresh=False, target_profile=None):
     print("-" * table_width)
     if not refresh:
         print(f"提示: 以上额度与订阅基于缓存展示。运行 {BOLD}python3 codex_mgr.py list --refresh{RESET} 可静默现查最新额度与订阅。")
-    print(f"提示: 后台守护服务每半小时会自动保活并刷新用量与订阅缓存。")
+    print(f"提示: 后台守护服务默认约每 2 小时校验并刷新用量缓存（含随机抖动）。")
 
 
 def cmd_list(refresh=False, target_profile=None):
@@ -1821,8 +2050,13 @@ def _pretty_status_desc(status):
         return "OK"
     if status.startswith("OK ("):
         return status
-    if status == "Token Expired":
-        return "Token Expired (Session已失效/在其他设备被踢，需重新登录)"
+    if status in ("Token Expired", "Token Rejected"):
+        return f"{status} (凭据被服务端拒绝；连续确认后才判定需重新登录)"
+    if status.startswith("Auth Check Inconclusive"):
+        return (
+            "Auth Check Inconclusive (两个兼容额度端点的结果不一致；"
+            "可能是当前节点或 Cloudflare，未判定登录失效)"
+        )
     if status == "Network Timeout":
         return "Network Timeout (接口请求超时，请检查您的代理/节点速度)"
     if status == "Fetch Timeout: SSL handshake":
@@ -1890,7 +2124,7 @@ def _cmd_wakeup_impl():
           2) 官方 OAuth 认证探针 + 额度查询，并安全接收可能轮换的凭证
              （前台 App 自身维持 live Session；此处同步备份并验证 OAuth）
       · 后台账号：
-          官方 Codex OAuth 探针 + 额度刷新（防止长期不用后凭证过期）
+          HTTPS 额度校验；仅在令牌临期/被拒绝时运行官方 OAuth 探针
     """
     sep = "=" * 60
     thin = "-" * 60
@@ -1935,7 +2169,13 @@ def _cmd_wakeup_impl():
         results.append(("前台", current_active, False, "备份同步失败"))
     else:
         print(f"  · 额度查询 / OAuth 校验 ..... 进行中")
-        active_info = silent_query_quota(current_active)
+        # 前台 App 是 live refresh token 的唯一所有者；守护进程只做 HTTPS 校验，
+        # 禁止在临时副本中刷新同一凭据，避免 refresh-token rotation 竞争。
+        active_info = silent_query_quota(
+            current_active,
+            probe_oauth=False,
+            include_subscription=False,
+        )
         status = active_info.get("status", "Unknown")
         ok = _is_query_ok(active_info)
         detail = status
@@ -1953,8 +2193,8 @@ def _cmd_wakeup_impl():
     # ── 后台账号 ──────────────────────────────────────────────────
     for i, p in enumerate(background_profiles, 1):
         print(f"[后台 {i}/{len(background_profiles)}] {p}")
-        print(f"  · OAuth 探针 / 额度刷新 ..... 进行中")
-        info = silent_query_quota(p)
+        print(f"  · HTTPS 校验 / 按需续签 .... 进行中")
+        info = silent_query_quota(p, probe_oauth=True, include_subscription=False)
         status = info.get("status", "Unknown")
         ok = _is_query_ok(info)
         detail = status
@@ -1962,7 +2202,7 @@ def _cmd_wakeup_impl():
             detail = f"OK ({format_rate_limit(info.get('rate_limit'), use_color=False)})"
         elif status == "OK" and info.get("auth_status") != "OK":
             detail = f"OAuth Error: {info.get('auth_status', 'Unknown')}"
-        print(f"  · OAuth 探针 / 额度刷新 ..... {_log_status(ok, detail)}")
+        print(f"  · HTTPS 校验 / 按需续签 .... {_log_status(ok, detail)}")
         if info.get("auth_status") != "OK":
             print(f"  · OAuth 保活告警 ............ {info.get('auth_status', 'Unknown')}")
         _check_token_status(p, info, revoked_accounts)
@@ -1975,14 +2215,14 @@ def _cmd_wakeup_impl():
     ok_n = sum(1 for r in results if r[2])
     fail_n = len(results) - ok_n
     print(thin)
-    print(f"本轮结果: 成功 {ok_n}  |  失败 {fail_n}  |  Session 失效 {len(revoked_accounts)}")
+    print(f"本轮结果: 成功 {ok_n}  |  失败 {fail_n}  |  凭据失效确认 {len(revoked_accounts)}")
     if results:
         for role, name, ok, detail in results:
             mark = "OK" if ok else "FAIL"
             pretty_detail = _pretty_status_desc(detail)
             print(f"  [{mark}] ({role}) {name}: {pretty_detail}")
     if revoked_accounts:
-        print("警告: 以下账号 Session 已失效，需重新登录后执行 add 重建备份:")
+        print("警告: 以下账号凭据已被连续确认拒绝，需重新登录后执行 add 重建备份:")
         for name in revoked_accounts:
             print(f"  ! {name}  ->  python3 codex_mgr.py switch {name}")
     print(f"前台客户端: 未关闭、未切换 (前台账号 '{current_active}' 使用中)")
@@ -1999,8 +2239,11 @@ def cmd_wakeup():
 
 
 def _check_token_status(profile_name, info, revoked_accounts):
-    """检测账号 session 是否被服务器撤销；失效时仅记入列表，汇总区统一打印。"""
-    if (info or {}).get("status") == "Token Expired":
+    """仅把连续、结构化确认的 401 记为凭据失效。"""
+    if (
+        (info or {}).get("status") in ("Token Expired", "Token Rejected")
+        and (info or {}).get("auth_failure_confirmed")
+    ):
         if profile_name not in revoked_accounts:
             revoked_accounts.append(profile_name)
 
@@ -2091,7 +2334,15 @@ def cmd_daemon():
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
-    interval_sec = 1800
+    try:
+        configured_minutes = int(os.environ.get(
+            DAEMON_INTERVAL_ENV,
+            str(DEFAULT_DAEMON_INTERVAL_MINUTES),
+        ))
+    except ValueError:
+        configured_minutes = DEFAULT_DAEMON_INTERVAL_MINUTES
+    configured_minutes = min(1440, max(15, configured_minutes))
+    interval_sec = configured_minutes * 60
     interval_min = interval_sec // 60
     cycle = 0
 
@@ -2100,7 +2351,7 @@ def cmd_daemon():
     print(f"  PID: {os.getpid()}")
     print(f"  周期: 每 {interval_min} 分钟执行一轮")
     print(f"  网络: {get_network_mode()} ({NETWORK_MODE_ENV})")
-    print("  动作: 前台同步备份+额度校验 | 后台官方 OAuth 探针")
+    print("  动作: 前台同步备份+HTTPS校验 | 后台HTTPS校验+按需OAuth续签")
     print("=" * 60)
 
     next_run = time.monotonic()
@@ -2115,14 +2366,13 @@ def cmd_daemon():
                 ran = False
                 print(f"本轮发生未捕获异常，守护进程将继续运行: {type(exc).__name__}: {exc}")
 
-            # 固定节拍，避免“执行耗时 + 30分钟”持续漂移；操作锁忙时 60 秒后再试。
+            # 低频 + 小幅随机抖动，避免所有账号长期以机器化固定节拍访问认证端点。
             if ran is False:
                 next_run = time.monotonic() + 60
                 delay = 60
             else:
-                next_run += interval_sec
-                if next_run <= time.monotonic():
-                    next_run = time.monotonic() + interval_sec
+                jittered_interval = interval_sec * random.uniform(0.9, 1.1)
+                next_run = time.monotonic() + jittered_interval
                 delay = max(1, next_run - time.monotonic())
             next_at = datetime.datetime.now() + datetime.timedelta(seconds=delay)
             next_str = next_at.strftime("%Y-%m-%d %H:%M:%S")
@@ -2148,6 +2398,7 @@ ChatGPT/Codex 多账号管理器 CLI
   add <name>        将您当前的登录态备份另存为一个全新的 Profile 账号
   switch <name>     一键备份当前账号，无缝切换到目标账号并重新打开客户端
   switch new        准备一个干净的“未登录”客户端环境以供登录并录入新账号
+  rename <old> <new> 安全重命名本地 Profile、活跃标记和用量缓存
   del/remove <name> 永久删除指定账号 Profile 的本地备份和用量缓存
   wakeup            手动执行一次批量刷新保活与用量更新
   daemon            在当前终端启动常驻后台守护进程 (建议使用 wakeup_daemon.sh 启动)
@@ -2218,6 +2469,12 @@ def main():
             print("示例: python3 codex_mgr.py switch account1")
             sys.exit(1)
         _run_locked(lambda: cmd_switch(sys.argv[2]))
+    elif cmd == "rename":
+        if len(sys.argv) != 4:
+            print("错误: 请指定旧名和新名。")
+            print("示例: python3 codex_mgr.py rename old_profile new_profile")
+            sys.exit(1)
+        _run_locked(lambda: cmd_rename(sys.argv[2], sys.argv[3]))
     elif cmd in ["del", "remove"]:
         if len(sys.argv) < 3:
             print("错误: 请指定要删除的账号 Profile 名称。")

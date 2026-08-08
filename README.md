@@ -10,15 +10,16 @@
 
 1. `codex_mgr.py`：核心 Python 管理 CLI。
   - `list`：本地解码各账号的凭证（`auth.json`），极其直观地列出所有 Profile 的绑定邮箱、计划类型（Plus/Free）、到期日及限额使用情况。
-  - `list --refresh` (或 `-r`)：通过官方 Codex OAuth 认证探针在线现查额度并验证登录态；失败时保留最近一次成功缓存并显示真实原因。
-  - `add <name>`：将您当前的登录态备份另存为一个全新的 Profile 账号（如果不传名字，则自动读取解密真实姓名做别名）。
+  - `list --refresh` (或 `-r`)：先通过官方兼容 HTTPS 额度端点在线现查；仅在令牌临近到期或 HTTPS 明确拒绝时才运行 OAuth 认证探针。失败时保留最近一次成功缓存并显示真实原因。
+  - `add <name>`：将您当前的登录态备份另存为一个全新的 Profile 账号（如果不传名字，或误写成 `add new`，都会自动读取真实姓名做别名）。
   - `switch <name>`：一键备份当前账号，无缝切换到目标账号并重新打开客户端。
   - `switch new`：准备一个干净的“未登录”客户端环境以供登录并录入新账号（免去在客户端内 Log Out 导致旧 Token 失效的隐患）。
+  - `rename <old> <new>`：安全重命名本地 Profile，同时迁移活跃标记与用量缓存。
   - `del/remove <name>`：永久删除指定账号 Profile 的本地备份和用量缓存。
-  - `wakeup`：对所有账号执行隔离的官方 OAuth 认证探针，同时同步活跃账号备份、按需接收安全的令牌轮换并更新额度缓存。若检测到某账号认证失效，会打印 ⚠️ 醒目警告。
+  - `wakeup`：先对所有账号执行隔离的 HTTPS 校验，同时同步活跃账号备份；仅在令牌临近到期或 HTTPS 明确拒绝时，按需接收安全的 OAuth 令牌轮换。两个兼容额度端点均返回结构化 401 才确认登录失效。
   - `daemon`：常驻后台定时执行唤醒。
 2. `wakeup_daemon.sh`：守护进程控制脚本。
-  - `./wakeup_daemon.sh start`：启动常驻后台守护服务，每半小时自动批量刷新保活并更新额度缓存。
+  - `./wakeup_daemon.sh start`：启动常驻后台守护服务，默认约每 2 小时校验并更新额度缓存。
   - `./wakeup_daemon.sh stop`：停止后台守护服务。
   - `./wakeup_daemon.sh restart`：一键安全重启后台守护服务并继承/追加历史日志。
   - `./wakeup_daemon.sh status`：查看运行状态及最近日志（已支持每行记录精确时间戳前缀）。
@@ -88,11 +89,17 @@ python3 codex_mgr.py switch <Profile名称>
 
 ### 3. 常驻后台自动保活防掉登
 
-后台守护每半小时自动保活一次，**全程不干扰您当前正在使用的账号和客户端**：
+后台守护默认约每 2 小时（带小幅随机抖动）执行一次校验，**全程不干扰您当前正在使用的账号和客户端**：
 
-- 正在前台使用的账号：由 ChatGPT App 自身后台心跳维持，守护进程会同步其最新数据到备份
-- 后台未使用的账号：各自在临时 `CODEX_HOME` 中运行官方 OAuth 认证探针，与前台完全隔离
+- 正在前台使用的账号：由 ChatGPT App 独占 refresh token；守护进程只同步较新的凭据并做 HTTPS 校验，不在副本中触发令牌轮换
+- 后台未使用的账号：先做低成本 HTTPS 校验；只有 access token 临近到期或被结构化 JSON 401 明确拒绝时，才在隔离的临时 `CODEX_HOME` 中运行官方 OAuth 探针
 - 若检测到任意账号 Session 被撤销（如在其他设备退出所有设备、修改密码等），会在日志中打印 ⚠️ 警告
+
+可按需调整周期（最小 15 分钟，建议不要低于 120 分钟）：
+
+```bash
+CODEX_MGR_DAEMON_INTERVAL_MINUTES=120 ./wakeup_daemon.sh restart
+```
 
 本机当前按 **TUN 模式**运行：守护进程忽略 `HTTP_PROXY` / `HTTPS_PROXY`，把网络流量统一交给 TUN 路由，避免二次代理。若以后关闭 TUN、只使用传统 HTTP/SOCKS 代理，请这样启动：
 
@@ -100,9 +107,9 @@ python3 codex_mgr.py switch <Profile名称>
 CODEX_MGR_NETWORK_MODE=env ./wakeup_daemon.sh restart
 ```
 
-`tun` 与 `env` 两种模式不要同时叠加。额度查询与 OAuth 认证会分别记录；只有官方认证 WebSocket 成功才算完整保活成功。日常守护不再拉起无头 ChatGPT，也不再用网页 Cookie 代替 Codex OAuth 登录态。
+`tun` 与 `env` 两种模式不要同时叠加。日常守护不再把固定频率的 WebSocket 探针当作“保活”；HTTPS 已认证成功时不会额外运行 OAuth doctor，也不再拉起无头 ChatGPT 或用网页 Cookie 代替 Codex OAuth 登录态。
 
-额度接口兼容 `codex/usage` 与 `wham/usage` 两条官方路径：如果某个 Cloudflare 边缘节点只挑战其中一条，程序会自动切换另一条；只有两条都失败才会把本轮额度标记为失败。单次 `Blocked by Cloudflare` 不再直接等同于账号掉登。
+额度接口兼容 `codex/usage` 与 `wham/usage` 两条官方路径：如果某个 Cloudflare 边缘节点只挑战其中一条，程序会自动切换另一条；只有两条都失败才会把本轮额度标记为失败。HTML 401/403 会识别为 Cloudflare/网络问题，只有结构化 JSON 401 连续确认后才提示凭据被拒绝。
 
 - **启动服务**：
   ```bash
