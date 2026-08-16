@@ -1,3 +1,4 @@
+import datetime
 import json
 import io
 import os
@@ -328,13 +329,15 @@ class QuotaParsingTests(unittest.TestCase):
         self.assertEqual(merged["subscription_status"], "OK")
 
     def test_format_subscription_until_marks_grace_and_nonrenew(self):
+        now = datetime.datetime(2026, 8, 2, tzinfo=datetime.timezone.utc)
         self.assertEqual(
             codex_mgr._format_subscription_until(
                 {
                     "subscription_until": "2026-08-01T19:38:18Z",
                     "is_delinquent": True,
                     "grace_period_end": "2026-08-04T19:38:08Z",
-                }
+                },
+                now=now,
             ),
             "2026-08-01 宽限08-04",
         )
@@ -343,10 +346,82 @@ class QuotaParsingTests(unittest.TestCase):
                 {
                     "subscription_until": "2026-08-21T10:12:37Z",
                     "will_renew": False,
-                }
+                },
+                now=now,
             ),
             "2026-08-21 不续费",
         )
+        self.assertEqual(
+            codex_mgr._format_subscription_until(
+                {"subscription_until": "2026-08-14T15:42:00Z", "will_renew": False},
+                now=datetime.datetime(2026, 8, 16, tzinfo=datetime.timezone.utc),
+            ),
+            "2026-08-14 已到期",
+        )
+
+    def test_expired_plus_reconciles_to_free(self):
+        now = datetime.datetime(2026, 8, 16, 8, 0, tzinfo=datetime.timezone.utc)
+        plan, until = codex_mgr._reconcile_plan_and_until(
+            "FREE",
+            "2026-08-14T15:42:00+00:00",
+            {
+                "plan_type": "plus",
+                "subscription_status": "OK",
+                "will_renew": False,
+                "is_delinquent": False,
+            },
+            now=now,
+        )
+        self.assertEqual(plan, "FREE")
+        self.assertEqual(until, "2026-08-14 已到期")
+
+    def test_stale_plus_without_until_follows_jwt_free(self):
+        now = datetime.datetime(2026, 8, 16, 8, 0, tzinfo=datetime.timezone.utc)
+        plan, until = codex_mgr._reconcile_plan_and_until(
+            "FREE",
+            "Unknown",
+            {
+                "plan_type": "plus",
+                "subscription_status": "OK",
+                "subscription_until": None,
+                "will_renew": False,
+            },
+            now=now,
+        )
+        self.assertEqual(plan, "FREE")
+        self.assertEqual(until, "—")
+
+    def test_active_plus_is_not_downgraded_by_old_jwt(self):
+        now = datetime.datetime(2026, 8, 16, 8, 0, tzinfo=datetime.timezone.utc)
+        plan, until = codex_mgr._reconcile_plan_and_until(
+            "FREE",
+            "2026-08-14T15:42:00+00:00",
+            {
+                "plan_type": "plus",
+                "subscription_until": "2026-09-04T00:00:00Z",
+                "will_renew": False,
+            },
+            now=now,
+        )
+        self.assertEqual(plan, "PLUS")
+        self.assertEqual(until, "2026-09-04 不续费")
+
+    def test_subscription_null_until_is_kept(self):
+        result = codex_mgr._parse_subscription_fetch_result(
+            {
+                "kind": "http",
+                "status": 200,
+                "body": {
+                    "plan_type": "plus",
+                    "active_until": None,
+                    "will_renew": False,
+                },
+            }
+        )
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["plan_type"], "plus")
+        self.assertIsNone(result["subscription_until"])
+        self.assertFalse(result["will_renew"])
 
     def test_ssl_handshake_timeout_is_classified(self):
         self.assertEqual(

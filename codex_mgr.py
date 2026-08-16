@@ -1263,14 +1263,16 @@ def _parse_subscription_fetch_result(fetch_result):
 
     plan_type = body.get("plan_type")
     active_until = body.get("active_until")
-    if not plan_type and not active_until:
+    if plan_type is None and "active_until" not in body:
         return {"status": f"Parse Error: missing subscription fields: {str(body)[:100]}"}
 
     result = {"status": "OK", "source": "subscriptions"}
     if plan_type:
         result["plan_type"] = plan_type
-    if active_until:
-        result["subscription_until"] = active_until
+    # active_until 为 null 表示当前没有有效订阅周期，必须显式记下，
+    # 避免列表回退到 JWT 里过期的 Plus 截止日期。
+    if "active_until" in body:
+        result["subscription_until"] = active_until or None
     if body.get("active_start"):
         result["subscription_active_start"] = body["active_start"]
     if "will_renew" in body:
@@ -1377,6 +1379,33 @@ def _merge_subscription_into_quota_result(quota_result, subscription_result):
     return result
 
 
+def _parse_iso_datetime(value):
+    """解析 ISO 时间戳；无法解析时返回 None。"""
+    if not value or value == "Unknown":
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        date_only = _date_only(text)
+        try:
+            parsed = datetime.datetime.fromisoformat(date_only)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
+
+
+def _grace_period_active(limits, now):
+    if not isinstance(limits, dict) or not limits.get("is_delinquent"):
+        return False
+    grace_end = _parse_iso_datetime(limits.get("grace_period_end"))
+    return bool(grace_end and grace_end > now)
+
+
 def _date_only(value):
     """把 ISO 时间戳裁成 YYYY-MM-DD；无法解析时原样返回。"""
     if not value or value == "Unknown":
@@ -1408,16 +1437,62 @@ def _plan_and_until_from_auth_payload(payload):
     return plan, until
 
 
-def _format_subscription_until(limits):
-    """格式化缓存中的订阅到期展示；欠费宽限期附在日期后。"""
-    until = _date_only(limits.get("subscription_until") or "Unknown")
+def _format_subscription_until(limits, until_raw=None, now=None):
+    """格式化订阅到期展示：宽限 / 不续费 / 已到期。"""
+    if until_raw is None:
+        until_raw = (limits or {}).get("subscription_until")
+    until = _date_only(until_raw or "Unknown")
     if until == "Unknown":
         return until
-    if limits.get("is_delinquent") and limits.get("grace_period_end"):
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    until_dt = _parse_iso_datetime(until_raw)
+    if _grace_period_active(limits, now):
         return f"{until} 宽限{_mmdd(limits.get('grace_period_end'))}"
-    if limits.get("will_renew") is False:
+    if until_dt and until_dt > now and (limits or {}).get("will_renew") is False:
         return f"{until} 不续费"
+    if until_dt and until_dt <= now:
+        return f"{until} 已到期"
     return until
+
+
+def _reconcile_plan_and_until(jwt_plan, jwt_until, limits, now=None):
+    """调和 JWT / 用量 / 订阅三方数据，避免过期 Plus 被展示成当前套餐。
+
+    usage/subscriptions 在降级后仍可能回传最后一档 ``plus``，而刷新后的
+    id_token 已是 ``free``。若截止日期已过且不在宽限内，以 FREE 为准。
+    """
+    limits = limits or {}
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    api_plan = str(limits["plan_type"]).upper() if limits.get("plan_type") else None
+    jwt_plan = str(jwt_plan or "Unknown").upper()
+    until_raw = limits.get("subscription_until")
+    if until_raw is None and jwt_until and jwt_until != "Unknown":
+        until_raw = jwt_until
+
+    until_dt = _parse_iso_datetime(until_raw)
+    in_grace = _grace_period_active(limits, now)
+    active_period = bool(in_grace or (until_dt and until_dt > now))
+    expired = bool(until_dt and until_dt <= now and not in_grace)
+    jwt_is_free = jwt_plan == "FREE"
+    canceled_without_until = (
+        limits.get("subscription_status") == "OK"
+        and limits.get("subscription_until") is None
+        and limits.get("will_renew") is False
+    )
+
+    if active_period:
+        plan = api_plan or jwt_plan or "Unknown"
+        return plan, _format_subscription_until(limits, until_raw, now=now)
+
+    if jwt_is_free or expired or canceled_without_until:
+        if until_raw:
+            return "FREE", _format_subscription_until(limits, until_raw, now=now)
+        return "FREE", "—"
+
+    plan = api_plan or jwt_plan or "Unknown"
+    if until_raw:
+        return plan, _format_subscription_until(limits, until_raw, now=now)
+    return plan, jwt_until or "Unknown"
 
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
@@ -1469,25 +1544,29 @@ def _pad_display(text, width, align="<"):
 
 
 def _resolve_plan_and_until(auth_path, usage_data):
-    """优先用 refresh 缓存的订阅元数据，否则回退本地 JWT。"""
-    plan = "Unknown"
-    until = "Unknown"
+    """优先用 refresh 缓存，但过期订阅以 JWT/到期日调和后的结果为准。"""
+    jwt_plan = "Unknown"
+    jwt_until = "Unknown"
     if os.path.exists(auth_path):
         try:
             with open(auth_path, "r") as auth_file:
                 auth_data = json.load(auth_file)
             id_token = (auth_data.get("tokens") or {}).get("id_token")
             if id_token:
-                plan, until = _plan_and_until_from_auth_payload(decode_jwt_payload(id_token))
+                jwt_plan, jwt_until = _plan_and_until_from_auth_payload(decode_jwt_payload(id_token))
+            if jwt_plan == "Unknown":
+                access_token = (auth_data.get("tokens") or {}).get("access_token")
+                if access_token:
+                    access_plan, _access_until = _plan_and_until_from_auth_payload(
+                        decode_jwt_payload(access_token)
+                    )
+                    if access_plan != "Unknown":
+                        jwt_plan = access_plan
         except Exception:
             pass
 
     limits = (usage_data or {}).get("limits") or {}
-    if limits.get("plan_type"):
-        plan = str(limits["plan_type"]).upper()
-    if limits.get("subscription_until"):
-        until = _format_subscription_until(limits)
-    return plan, until
+    return _reconcile_plan_and_until(jwt_plan, jwt_until, limits)
 
 
 def _validate_heartbeat_identity(heartbeat, expected_account_id, expected_email):
