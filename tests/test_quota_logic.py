@@ -653,16 +653,17 @@ class CredentialSyncTests(unittest.TestCase):
 
 
 class ProfileNamingTests(unittest.TestCase):
-    def test_add_new_uses_detected_name_instead_of_literal_new(self):
-        def jwt(payload):
-            import base64
-            encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
-            return f"header.{encoded}.signature"
+    @staticmethod
+    def _jwt(payload):
+        import base64
+        encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        return f"header.{encoded}.signature"
 
+    def test_add_new_uses_detected_name_instead_of_literal_new(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             auth_file = os.path.join(temp_dir, "auth.json")
             pathlib.Path(auth_file).write_text(json.dumps({
-                "tokens": {"id_token": jwt({"name": "Jane Doe", "email": "new@example.com"})},
+                "tokens": {"id_token": self._jwt({"name": "Jane Doe", "email": "new@example.com"})},
             }))
             prefix = os.path.join(temp_dir, "Profile")
             with (
@@ -679,6 +680,51 @@ class ProfileNamingTests(unittest.TestCase):
 
         self.assertEqual(backup.call_args_list[-1].args[0], "Jane_Doe")
         set_active.assert_called_once_with("Jane_Doe")
+
+    def test_add_existing_account_updates_profile_and_active_marker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            auth_file = os.path.join(temp_dir, ".codex", "auth.json")
+            prefix = os.path.join(temp_dir, "Profile")
+            profile_dir = prefix + "_Moiray"
+            app_dir = os.path.join(temp_dir, "Codex")
+            os.makedirs(os.path.dirname(auth_file))
+            os.makedirs(profile_dir)
+            live_auth = {
+                "last_refresh": "2026-08-28T02:16:29Z",
+                "tokens": {
+                    "account_id": "acct-moiray",
+                    "id_token": self._jwt({"name": "Moiray", "email": "moiray@example.com"}),
+                    "refresh_token": "fresh-refresh",
+                },
+            }
+            old_auth = {
+                "last_refresh": "2026-08-26T13:09:17Z",
+                "tokens": {
+                    "account_id": "acct-moiray",
+                    "id_token": self._jwt({"name": "Moiray", "email": "moiray@example.com"}),
+                    "refresh_token": "old-refresh",
+                },
+            }
+            pathlib.Path(auth_file).write_text(json.dumps(live_auth))
+            pathlib.Path(profile_dir, "auth.json").write_text(json.dumps(old_auth))
+            with (
+                mock.patch("codex_mgr.AUTH_FILE", auth_file),
+                mock.patch("codex_mgr.CODEX_HOME", os.path.dirname(auth_file)),
+                mock.patch("codex_mgr.APP_SUPPORT_DIR", app_dir),
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr.get_profiles", return_value=["Moiray"]),
+                mock.patch("codex_mgr.kill_chatgpt_processes") as kill,
+                mock.patch("codex_mgr.set_current_active") as set_active,
+                mock.patch("codex_mgr.subprocess.run") as run,
+            ):
+                codex_mgr.cmd_add()
+
+            saved = json.loads(pathlib.Path(profile_dir, "auth.json").read_text())
+
+        self.assertEqual(saved["tokens"]["refresh_token"], "fresh-refresh")
+        kill.assert_called_once_with()
+        set_active.assert_called_once_with("Moiray")
+        run.assert_called_once_with(["open", "-a", "/Applications/ChatGPT.app"])
 
     def test_rename_moves_profile_cache_and_active_marker(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -724,6 +770,53 @@ class ProbeSchedulingTests(unittest.TestCase):
             ):
                 result = codex_mgr._query_quota_once("test", include_subscription=False)
         self.assertEqual(result["status"], "OK")
+        oauth_probe.assert_not_called()
+
+    def test_near_expiry_runs_oauth_probe_even_when_quota_is_inconclusive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = os.path.join(temp_dir, "Profile")
+            profile_dir = prefix + "_test"
+            os.makedirs(profile_dir)
+            pathlib.Path(profile_dir, "auth.json").write_text(json.dumps({
+                "tokens": {"account_id": "acct-1", "access_token": "token"},
+            }))
+            with (
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr._query_quota_with_token", return_value={
+                    "status": "Auth Check Inconclusive: quota endpoints disagree",
+                    "auth_failure_confirmed": False,
+                }),
+                mock.patch("codex_mgr._access_token_needs_refresh", return_value=True),
+                mock.patch(
+                    "codex_mgr._probe_codex_oauth",
+                    return_value={"status": "OK", "credentials_refreshed": False},
+                ) as oauth_probe,
+            ):
+                result = codex_mgr._query_quota_once("test", include_subscription=False)
+
+        self.assertTrue(result["status"].startswith("Auth Check Inconclusive"))
+        oauth_probe.assert_called_once_with("test")
+
+    def test_fresh_token_skips_oauth_probe_when_quota_is_inconclusive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = os.path.join(temp_dir, "Profile")
+            profile_dir = prefix + "_test"
+            os.makedirs(profile_dir)
+            pathlib.Path(profile_dir, "auth.json").write_text(json.dumps({
+                "tokens": {"account_id": "acct-1", "access_token": "token"},
+            }))
+            with (
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr._query_quota_with_token", return_value={
+                    "status": "Auth Check Inconclusive: quota endpoints disagree",
+                    "auth_failure_confirmed": False,
+                }),
+                mock.patch("codex_mgr._access_token_needs_refresh", return_value=False),
+                mock.patch("codex_mgr._probe_codex_oauth") as oauth_probe,
+            ):
+                result = codex_mgr._query_quota_once("test", include_subscription=False)
+
+        self.assertTrue(result["status"].startswith("Auth Check Inconclusive"))
         oauth_probe.assert_not_called()
 
     def test_subscription_is_queried_when_quota_endpoint_fails(self):
@@ -779,6 +872,148 @@ class ProbeSchedulingTests(unittest.TestCase):
 
 
 class StatePromotionTests(unittest.TestCase):
+    def test_restore_same_account_promotes_newer_live_credentials(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = os.path.join(temp_dir, "Codex")
+            prefix = os.path.join(temp_dir, "Profile")
+            backup_dir = prefix + "_target"
+            auth_file = os.path.join(temp_dir, ".codex", "auth.json")
+            active_file = os.path.join(temp_dir, "active")
+            os.makedirs(backup_dir)
+            os.makedirs(os.path.dirname(auth_file))
+            pathlib.Path(auth_file).write_text(json.dumps({
+                "last_refresh": "2026-08-28T02:16:29Z",
+                "tokens": {"account_id": "acct-target", "refresh_token": "fresh"},
+            }))
+            pathlib.Path(backup_dir, "auth.json").write_text(json.dumps({
+                "last_refresh": "2026-08-26T13:09:17Z",
+                "tokens": {"account_id": "acct-target", "refresh_token": "old"},
+            }))
+            with (
+                mock.patch("codex_mgr.APP_SUPPORT_DIR", app_dir),
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr.CODEX_HOME", os.path.dirname(auth_file)),
+                mock.patch("codex_mgr.AUTH_FILE", auth_file),
+                mock.patch("codex_mgr.ACTIVE_FILE", active_file),
+            ):
+                restored = codex_mgr.restore_profile("target")
+
+            live = json.loads(pathlib.Path(auth_file).read_text())
+            saved = json.loads(pathlib.Path(backup_dir, "auth.json").read_text())
+
+        self.assertTrue(restored)
+        self.assertEqual(live["tokens"]["refresh_token"], "fresh")
+        self.assertEqual(saved["tokens"]["refresh_token"], "fresh")
+
+    def test_restore_different_account_still_loads_target_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = os.path.join(temp_dir, "Codex")
+            prefix = os.path.join(temp_dir, "Profile")
+            backup_dir = prefix + "_target"
+            auth_file = os.path.join(temp_dir, ".codex", "auth.json")
+            active_file = os.path.join(temp_dir, "active")
+            os.makedirs(backup_dir)
+            os.makedirs(os.path.dirname(auth_file))
+            pathlib.Path(auth_file).write_text(json.dumps({
+                "last_refresh": "2026-08-28T02:16:29Z",
+                "tokens": {"account_id": "acct-current", "refresh_token": "current"},
+            }))
+            pathlib.Path(backup_dir, "auth.json").write_text(json.dumps({
+                "last_refresh": "2026-08-26T13:09:17Z",
+                "tokens": {"account_id": "acct-target", "refresh_token": "target"},
+            }))
+            with (
+                mock.patch("codex_mgr.APP_SUPPORT_DIR", app_dir),
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr.CODEX_HOME", os.path.dirname(auth_file)),
+                mock.patch("codex_mgr.AUTH_FILE", auth_file),
+                mock.patch("codex_mgr.ACTIVE_FILE", active_file),
+            ):
+                restored = codex_mgr.restore_profile("target")
+
+            live = json.loads(pathlib.Path(auth_file).read_text())
+
+        self.assertTrue(restored)
+        self.assertEqual(live["tokens"]["account_id"], "acct-target")
+        self.assertEqual(live["tokens"]["refresh_token"], "target")
+
+    def test_switch_current_profile_syncs_live_credentials(self):
+        profile_name = "UnitTestCurrentProfile42"
+        output = io.StringIO()
+        with (
+            mock.patch("codex_mgr.get_current_active", return_value=profile_name),
+            mock.patch("codex_mgr.backup_profile", return_value=True) as backup,
+            mock.patch("codex_mgr.subprocess.run") as run,
+            mock.patch("sys.stdout", output),
+        ):
+            codex_mgr.cmd_switch(profile_name)
+
+        backup.assert_called_once_with(profile_name, quiet=True)
+        run.assert_called_once_with(["open", "-a", "/Applications/ChatGPT.app"])
+        self.assertIn("[耗时] 同步当前账号凭据", output.getvalue())
+        self.assertIn("[耗时] 提交 App 启动请求", output.getvalue())
+        self.assertIn("[耗时] switch 命令总计（不含 App 界面就绪）", output.getvalue())
+
+    def test_switch_reports_each_normal_phase_duration(self):
+        target = "UnitTestTimingTarget42"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = os.path.join(temp_dir, "Profile")
+            os.makedirs(prefix + "_" + target)
+            output = io.StringIO()
+            with (
+                mock.patch("codex_mgr.BACKUP_PREFIX", prefix),
+                mock.patch("codex_mgr.get_current_active", return_value="CurrentProfile"),
+                mock.patch("codex_mgr.kill_chatgpt_processes") as kill,
+                mock.patch("codex_mgr.backup_profile", return_value=True) as backup,
+                mock.patch("codex_mgr.restore_profile", return_value=True) as restore,
+                mock.patch("codex_mgr.subprocess.run") as run,
+                mock.patch("sys.stdout", output),
+            ):
+                codex_mgr.cmd_switch(target)
+
+        text = output.getvalue()
+        kill.assert_called_once_with()
+        backup.assert_called_once_with("CurrentProfile")
+        restore.assert_called_once_with(target)
+        run.assert_called_once_with(["open", "-a", "/Applications/ChatGPT.app"])
+        self.assertIn("[耗时] 关闭 ChatGPT/Codex 进程", text)
+        self.assertIn("[耗时] 备份当前账号", text)
+        self.assertIn("[耗时] 恢复目标账号", text)
+        self.assertIn("[耗时] 提交 App 启动请求", text)
+        self.assertIn("[耗时] switch 命令总计（不含 App 界面就绪）", text)
+
+    def test_switch_new_reports_reset_phase_duration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = os.path.join(temp_dir, "Codex")
+            auth_file = os.path.join(temp_dir, ".codex", "auth.json")
+            active_file = os.path.join(temp_dir, "active")
+            os.makedirs(app_dir)
+            os.makedirs(os.path.dirname(auth_file))
+            pathlib.Path(auth_file).write_text("{}")
+            pathlib.Path(active_file).write_text("CurrentProfile")
+            output = io.StringIO()
+            with (
+                mock.patch("codex_mgr.APP_SUPPORT_DIR", app_dir),
+                mock.patch("codex_mgr.AUTH_FILE", auth_file),
+                mock.patch("codex_mgr.ACTIVE_FILE", active_file),
+                mock.patch("codex_mgr.get_current_active", return_value="CurrentProfile"),
+                mock.patch("codex_mgr.kill_chatgpt_processes") as kill,
+                mock.patch("codex_mgr.backup_profile", return_value=True) as backup,
+                mock.patch("codex_mgr.subprocess.run") as run,
+                mock.patch("sys.stdout", output),
+            ):
+                codex_mgr.cmd_switch("new")
+
+        text = output.getvalue()
+        kill.assert_called_once_with()
+        backup.assert_called_once_with("CurrentProfile")
+        run.assert_called_once_with(["open", "-a", "/Applications/ChatGPT.app"])
+        self.assertIn("[耗时] 关闭 ChatGPT/Codex 进程", text)
+        self.assertIn("[耗时] 备份当前账号", text)
+        self.assertIn("[耗时] 重置客户端环境", text)
+        self.assertIn("[耗时] 提交 App 启动请求", text)
+        self.assertIn("[耗时] switch 命令总计（不含 App 界面就绪）", text)
+
     def test_restore_removes_previous_accounts_storage_and_cookie_sidecars(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app_dir = os.path.join(temp_dir, "Codex")

@@ -397,7 +397,28 @@ def restore_profile(profile_name):
     if not os.path.exists(backup_dir):
         print(f"[{RED}ERROR{RESET}] Profile {profile_name} 备份不存在。")
         return False
-        
+
+    # 在修改 Cookies/Storage 之前先完成凭据预检。重新登录已有账号后，live
+    # auth.json 可能比 Profile 备份更新；同账号只允许凭据向前同步，禁止旧
+    # refresh token 覆盖刚登录生成的新 token。
+    backup_auth = os.path.join(backup_dir, "auth.json")
+    if os.path.exists(backup_auth) and os.path.exists(AUTH_FILE):
+        try:
+            live_auth = _read_auth_json(AUTH_FILE)
+            saved_auth = _read_auth_json(backup_auth)
+            live_account = _auth_account_id(live_auth)
+            saved_account = _auth_account_id(saved_auth)
+            if live_account and saved_account and live_account == saved_account:
+                auth_ok, auth_action = _sync_auth_snapshot(AUTH_FILE, backup_auth)
+                if not auth_ok:
+                    print(f"[{RED}ERROR{RESET}] 同账号凭据同步失败: {auth_action}")
+                    return False
+                if auth_action == "copied":
+                    print("检测到当前账号有较新的登录凭据，已先更新 Profile，避免旧令牌回滚。")
+        except Exception as e:
+            print(f"[{RED}ERROR{RESET}] 比较 live/Profile 凭据失败: {e}")
+            return False
+
     print(f"正在加载账号 '{profile_name}' 的状态...")
     os.makedirs(APP_SUPPORT_DIR, exist_ok=True)
     default_dir = os.path.join(APP_SUPPORT_DIR, "Default")
@@ -427,7 +448,6 @@ def restore_profile(profile_name):
                 shutil.rmtree(dst_folder)
                 
     # 还原 auth.json
-    backup_auth = os.path.join(backup_dir, "auth.json")
     if os.path.exists(backup_auth):
         os.makedirs(CODEX_HOME, exist_ok=True)
         _atomic_copy_file(backup_auth, AUTH_FILE, mode=0o600)
@@ -464,6 +484,7 @@ def cmd_add(profile_name=None):
 
     # 2. 在做任何操作之前，先扫描所有现有 Profile，检查是否已有相同邮箱账号
     #    防止同一账号以不同名字被重复保存
+    existing_profile = None
     if detected_email:
         existing_profiles = get_profiles()
         for ep in existing_profiles:
@@ -476,12 +497,26 @@ def cmd_add(profile_name=None):
                     if ep_token:
                         ep_payload = decode_jwt_payload(ep_token)
                         if ep_payload.get("email") == detected_email:
-                            print(f"{YELLOW}提示: 当前登录的账号 ({detected_email}) 已经以 Profile '{ep}' 保存过了。{RESET}")
-                            print(f"如果您想更新该 Profile 的备份，请直接切换到它：python3 codex_mgr.py switch {ep}")
-                            print("无需重复添加。")
-                            return
+                            existing_profile = ep
+                            break
                 except Exception:
                     pass
+
+    if existing_profile:
+        print(f"{YELLOW}提示: 当前登录的账号 ({detected_email}) 已经以 Profile '{existing_profile}' 保存过了。{RESET}")
+        print(f"正在把本次重新登录生成的新凭据同步到已有 Profile '{existing_profile}'...")
+        # 与新增 Profile 的正常路径一致，先关闭 App 再做完整备份，
+        # 避免运行中的 Local/Session Storage 只保存到一半。
+        kill_chatgpt_processes()
+        backup_ok = backup_profile(existing_profile)
+        if backup_ok:
+            set_current_active(existing_profile)
+            print(f"{GREEN}已有 Profile '{existing_profile}' 已更新，并重新标记为当前活跃账号。{RESET}")
+        else:
+            print(f"{RED}[安全中止] 已有 Profile '{existing_profile}' 更新失败，未覆盖旧备份。{RESET}")
+        print("正在重新打开 ChatGPT 应用程序...")
+        subprocess.run(["open", "-a", "/Applications/ChatGPT.app"])
+        return
 
     if not profile_name:
         if detected_name:
@@ -548,11 +583,23 @@ def cmd_add(profile_name=None):
 
 
 def cmd_switch(target_profile):
+    switch_started = time.monotonic()
+
+    def log_elapsed(label, started):
+        elapsed = time.monotonic() - started
+        print(f"  [耗时] {label}: {elapsed:.2f} 秒")
+        return elapsed
+
+    def log_total():
+        log_elapsed("switch 命令总计（不含 App 界面就绪）", switch_started)
+
     current = get_current_active()
     
     # 特殊指令: 切换到一个干净的“未登录”环境，用于添加/登录全新账号
     if target_profile.lower() in ["new", "--new"]:
+        step_started = time.monotonic()
         kill_chatgpt_processes()
+        log_elapsed("关闭 ChatGPT/Codex 进程", step_started)
         
         # 漏洞 A 修复：如果 current 标记为空，但实际上本地有已登录的数据（例如未记录的野生登录态）
         if not current:
@@ -582,20 +629,26 @@ def cmd_switch(target_profile):
                 
         if current:
             print(f"正在增量备份当前账号 '{current}' 的最新状态...")
+            step_started = time.monotonic()
             backup_ok = backup_profile(current)
+            log_elapsed("备份当前账号", step_started)
             if not backup_ok:
                 print(f"{RED}[安全中止] 账号 '{current}' 备份失败！为保护您的账号数据，已取消清空操作。{RESET}")
                 print("请检查磁盘空间或文件权限后重试。")
+                log_total()
                 return
             print(f"{GREEN}备份成功，账号数据已安全保存。{RESET}")
             
         print("正在重置客户端运行环境，创造干净的“未登录”状态...")
+        step_started = time.monotonic()
         if os.path.exists(APP_SUPPORT_DIR):
             try:
                 shutil.rmtree(APP_SUPPORT_DIR)
             except Exception as e:
                 print(f"{RED}清空缓存目录失败: {e}{RESET}")
                 print("操作已中止，您的账号数据未受影响。")
+                log_elapsed("重置客户端环境（失败）", step_started)
+                log_total()
                 return
 
         os.makedirs(APP_SUPPORT_DIR, exist_ok=True)
@@ -610,6 +663,8 @@ def cmd_switch(target_profile):
             except Exception as e:
                 print(f"{RED}清除 auth.json 失败: {e}{RESET}")
                 print("操作已中止。请检查文件权限后重试，以免客户端继续自动登录旧账号。")
+                log_elapsed("重置客户端环境（失败）", step_started)
+                log_total()
                 return
 
         if os.path.exists(ACTIVE_FILE):
@@ -617,13 +672,17 @@ def cmd_switch(target_profile):
                 os.remove(ACTIVE_FILE)
             except Exception:
                 pass
+        log_elapsed("重置客户端环境", step_started)
 
         print(f"\n{GREEN}成功重置客户端！当前已处于干净的“未登录”状态。{RESET}")
         print("正在拉起 ChatGPT 应用程序...")
         print(f"{BOLD}提示: 请在弹出的客户端窗口中，直接输入并登录您的第二个新账号。{RESET}")
         print(f"提示: 登录成功后，在终端运行 {BOLD}python3 codex_mgr.py add{RESET} 即可将此新账号自动完成备份。")
 
+        step_started = time.monotonic()
         subprocess.run(["open", "-a", "/Applications/ChatGPT.app"])
+        log_elapsed("提交 App 启动请求", step_started)
+        log_total()
         return
 
     # 1. 获取所有可用的 Profile 列表
@@ -654,8 +713,19 @@ def cmd_switch(target_profile):
             return
 
     if current == target_profile:
-        print(f"您当前已处于账号 '{target_profile}' 下！正在重新打开 App...")
+        print(f"您当前已处于账号 '{target_profile}' 下，正在同步最新登录凭据...")
+        step_started = time.monotonic()
+        sync_ok = backup_profile(target_profile, quiet=True)
+        log_elapsed("同步当前账号凭据", step_started)
+        if not sync_ok:
+            print(f"{RED}[安全中止] 当前 live 身份与 Profile 不一致或同步失败，未执行覆盖。{RESET}")
+            log_total()
+            return
+        print("同步成功，正在重新打开 App...")
+        step_started = time.monotonic()
         subprocess.run(["open", "-a", "/Applications/ChatGPT.app"])
+        log_elapsed("提交 App 启动请求", step_started)
+        log_total()
         return
         
     backup_dir = f"{BACKUP_PREFIX}_{target_profile}"
@@ -665,22 +735,34 @@ def cmd_switch(target_profile):
         return
         
     # 1. 退出进程
+    step_started = time.monotonic()
     kill_chatgpt_processes()
+    log_elapsed("关闭 ChatGPT/Codex 进程", step_started)
     
     # 2. 备份当前
     if current:
         print(f"正在增量备份当前账号 '{current}' 的最新状态...")
-        if not backup_profile(current):
+        step_started = time.monotonic()
+        backup_ok = backup_profile(current)
+        log_elapsed("备份当前账号", step_started)
+        if not backup_ok:
             print(f"{RED}[安全中止] 当前账号备份失败，已取消切换，避免登录态丢失或串号。{RESET}")
+            log_total()
             return
         
     # 3. 还原目标
-    if restore_profile(target_profile):
+    step_started = time.monotonic()
+    restore_ok = restore_profile(target_profile)
+    log_elapsed("恢复目标账号", step_started)
+    if restore_ok:
         print(f"{GREEN}成功切换到账号 '{target_profile}'！{RESET}")
         
     # 4. 重新拉起
     print("正在重新打开 ChatGPT 应用程序...")
+    step_started = time.monotonic()
     subprocess.run(["open", "-a", "/Applications/ChatGPT.app"])
+    log_elapsed("提交 App 启动请求", step_started)
+    log_total()
 
 def cmd_del(target_profile):
     # 1. 获取所有可用的 Profile 列表
@@ -1732,9 +1814,13 @@ def _query_quota_once(profile_name, probe_oauth=True, include_subscription=True)
         }
 
     direct_result = _query_quota_with_token(access_token)
+    # Token 续签时机只由凭据自身的到期时间决定，不能依赖额度端点必须返回 OK。
+    # 否则 access token 已进入刷新窗口时，Cloudflare/端点分歧会形成续签饥饿：
+    # HTTPS 不是 OK，OAuth doctor 又永远不运行。普通 Inconclusive 且 token 尚新时
+    # 仍跳过 doctor，避免网络波动触发不必要的 refresh-token rotation。
     needs_oauth = probe_oauth and (
         direct_result.get("status") == "Token Rejected"
-        or (direct_result.get("status") == "OK" and _access_token_needs_refresh(auth_data))
+        or _access_token_needs_refresh(auth_data)
     )
     if needs_oauth:
         oauth_result = _probe_codex_oauth(profile_name)
