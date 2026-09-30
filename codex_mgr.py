@@ -1488,6 +1488,30 @@ def _grace_period_active(limits, now):
     return bool(grace_end and grace_end > now)
 
 
+def _quota_shape_indicates_free(limits):
+    """Recognize the monthly-only quota shape used by FREE accounts.
+
+    Subscription and JWT metadata can lag behind a downgrade and still report
+    ``plus`` with a future cancellation timestamp. A sole 30-day usage window
+    (with no secondary window) is a stronger current-entitlement signal than
+    those stale labels; PLUS/Codex accounts expose shorter quota windows.
+    """
+    rate_limit = (limits or {}).get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        return False
+    primary = rate_limit.get("primary_window")
+    secondary = rate_limit.get("secondary_window")
+    if not isinstance(primary, dict) or not primary or (isinstance(secondary, dict) and secondary):
+        return False
+    if secondary not in (None, {}):
+        return False
+    try:
+        window_seconds = int(primary.get("limit_window_seconds") or 0)
+    except (TypeError, ValueError):
+        return False
+    return window_seconds == 30 * 24 * 60 * 60
+
+
 def _date_only(value):
     """把 ISO 时间戳裁成 YYYY-MM-DD；无法解析时原样返回。"""
     if not value or value == "Unknown":
@@ -1561,6 +1585,12 @@ def _reconcile_plan_and_until(jwt_plan, jwt_until, limits, now=None):
         and limits.get("subscription_until") is None
         and limits.get("will_renew") is False
     )
+
+    # A downgrade may leave both the refreshed JWT and subscriptions response
+    # carrying the previous PLUS tier. The current quota shape is the available
+    # entitlement signal in that case, and must win over a stale future until.
+    if _quota_shape_indicates_free(limits):
+        return "FREE", "—"
 
     if active_period:
         plan = api_plan or jwt_plan or "Unknown"
