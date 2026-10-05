@@ -35,7 +35,15 @@ OPERATION_LOCK_FILE = os.path.join(CODEX_HOME, "codex_mgr_operation.lock")
 DAEMON_LOCK_FILE = os.path.join(CODEX_HOME, "codex_mgr_daemon.lock")
 DAEMON_PID_FILE = os.path.join(CODEX_HOME, "codex_mgr_daemon.pid")
 CAFFEINATE_PID_FILE = os.path.join(CODEX_HOME, "codex_mgr_caffeinate.pid")
+# Older ChatGPT builds exposed the bundled CLI at ``Resources/codex``. Current
+# builds keep it under ``Resources/codex-cli/bin/codex``; retain the old value
+# as the override tested first and discover the current location at runtime.
 CODEX_CLI_PATH = "/Applications/ChatGPT.app/Contents/Resources/codex"
+CODEX_CLI_CANDIDATES = (
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+    "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+)
 
 _DAEMON_LOCK_FD = None
 
@@ -213,6 +221,22 @@ def _access_token_needs_refresh(auth_data, now=None, margin=OAUTH_REFRESH_MARGIN
     if not expires_at:
         return True
     return expires_at - (time.time() if now is None else now) <= margin
+
+
+def _find_codex_cli():
+    """Find the bundled Codex CLI used by the OAuth doctor probe."""
+    paths = (CODEX_CLI_PATH,) + CODEX_CLI_CANDIDATES
+    configured_path = shutil.which("codex")
+    if configured_path:
+        paths += (configured_path,)
+    seen = set()
+    for path in paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
 
 def kill_chatgpt_processes():
     print("正在安全关闭 ChatGPT / Codex 进程...")
@@ -1719,7 +1743,8 @@ def _probe_codex_oauth(profile_name, timeout=35):
     auth_path = os.path.join(backup_dir, "auth.json")
     if not os.path.exists(auth_path):
         return {"status": "No Auth Data", "source": "codex-doctor"}
-    if not os.path.exists(CODEX_CLI_PATH):
+    cli_path = _find_codex_cli()
+    if not cli_path:
         return {"status": "Codex CLI Missing", "source": "codex-doctor"}
 
     temp_home = tempfile.mkdtemp(prefix="codex_oauth_probe_")
@@ -1730,7 +1755,7 @@ def _probe_codex_oauth(profile_name, timeout=35):
         original_account = str((original.get("tokens") or {}).get("account_id") or "")
 
         completed = subprocess.run(
-            [CODEX_CLI_PATH, "doctor", "--json"],
+            [cli_path, "doctor", "--json"],
             capture_output=True,
             text=True,
             timeout=timeout,
