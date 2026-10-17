@@ -167,6 +167,68 @@ def _auth_account_id(auth_data):
     return str(((auth_data or {}).get("tokens") or {}).get("account_id") or "")
 
 
+def _auth_user_identity(auth_data):
+    """提取 auth.json 中稳定的用户身份 (email, user_id/sub, account_id)。"""
+    tokens = (auth_data or {}).get("tokens") or {}
+    account_id = str(tokens.get("account_id") or "").strip()
+
+    email = ""
+    user_id = ""
+    for token_name in ("id_token", "access_token"):
+        token_str = tokens.get(token_name) or ""
+        if not token_str:
+            continue
+        payload = decode_jwt_payload(token_str)
+        if isinstance(payload, dict):
+            if not email:
+                val = payload.get("email")
+                if isinstance(val, str) and val.strip():
+                    email = val.strip().lower()
+            if not user_id:
+                auth_sec = payload.get("https://api.openai.com/auth")
+                if isinstance(auth_sec, dict) and auth_sec.get("user_id"):
+                    user_id = str(auth_sec["user_id"]).strip()
+                elif payload.get("sub"):
+                    user_id = str(payload["sub"]).strip()
+    return {
+        "email": email,
+        "user_id": user_id,
+        "account_id": account_id,
+    }
+
+
+def _auth_identities_match(auth1, auth2):
+    """
+    判断两个 auth.json 是否属于同一账号主体。
+    返回 (matches: bool, reason: str)。
+
+    判定逻辑：
+    1. 优先基于稳定的 user_id / sub 进行比对（黄金标准）；
+    2. 其次基于 email 进行比对；
+    3. 若双方均缺乏 user_id 和 email（例如纯 mock 凭证），则退化为比较 account_id；
+    4. 允许同一用户在不同的工作区（Workspace / account_id）之间变更（如 Team 降级至 Free）。
+    """
+    id1 = _auth_user_identity(auth1)
+    id2 = _auth_user_identity(auth2)
+
+    if id1["user_id"] and id2["user_id"]:
+        if id1["user_id"] == id2["user_id"]:
+            return True, "user_id_match"
+        return False, f"user_id mismatch ({id1['user_id']} vs {id2['user_id']})"
+
+    if id1["email"] and id2["email"]:
+        if id1["email"] == id2["email"]:
+            return True, "email_match"
+        return False, f"email mismatch ({id1['email']} vs {id2['email']})"
+
+    if id1["account_id"] and id2["account_id"]:
+        if id1["account_id"] == id2["account_id"]:
+            return True, "account_id_match"
+        return False, f"account_id mismatch ({id1['account_id']} vs {id2['account_id']})"
+
+    return True, "insufficient_data"
+
+
 def _auth_generation(auth_data):
     """返回凭据的新旧代际；用于防止旧快照覆盖已轮换的新凭据。"""
     values = []
@@ -199,11 +261,10 @@ def _read_auth_json(path):
 def _sync_auth_snapshot(src, dst):
     """同账号凭据只向前同步。返回 (ok, action)。"""
     source = _read_auth_json(src)
-    source_account = _auth_account_id(source)
     if os.path.exists(dst):
         target = _read_auth_json(dst)
-        target_account = _auth_account_id(target)
-        if source_account and target_account and source_account != target_account:
+        matched, _ = _auth_identities_match(source, target)
+        if not matched:
             return False, "identity-mismatch"
         if _auth_generation(target) > _auth_generation(source):
             return True, "destination-newer"
@@ -353,11 +414,12 @@ def backup_profile(profile_name, quiet=False):
     backup_auth = os.path.join(backup_dir, "auth.json")
     if os.path.exists(AUTH_FILE) and os.path.exists(backup_auth):
         try:
-            live_account = _auth_account_id(_read_auth_json(AUTH_FILE))
-            saved_account = _auth_account_id(_read_auth_json(backup_auth))
-            if live_account and saved_account and live_account != saved_account:
+            live_auth = _read_auth_json(AUTH_FILE)
+            saved_auth = _read_auth_json(backup_auth)
+            matched, reason = _auth_identities_match(live_auth, saved_auth)
+            if not matched:
                 if not quiet:
-                    print(f"[{RED}ERROR{RESET}] 活跃账号身份与 Profile '{profile_name}' 不一致，已拒绝覆盖备份。")
+                    print(f"[{RED}ERROR{RESET}] 活跃账号身份与 Profile '{profile_name}' 不一致 ({reason})，已拒绝覆盖备份。")
                 return False
         except Exception as e:
             if not quiet:
@@ -430,9 +492,8 @@ def restore_profile(profile_name):
         try:
             live_auth = _read_auth_json(AUTH_FILE)
             saved_auth = _read_auth_json(backup_auth)
-            live_account = _auth_account_id(live_auth)
-            saved_account = _auth_account_id(saved_auth)
-            if live_account and saved_account and live_account == saved_account:
+            matched, _ = _auth_identities_match(live_auth, saved_auth)
+            if matched:
                 auth_ok, auth_action = _sync_auth_snapshot(AUTH_FILE, backup_auth)
                 if not auth_ok:
                     print(f"[{RED}ERROR{RESET}] 同账号凭据同步失败: {auth_action}")
@@ -1358,6 +1419,22 @@ def _parse_subscription_fetch_result(fetch_result):
         return {"status": "Token Expired"}
     if http_status == 403:
         return {"status": "Blocked by Cloudflare"}
+    if http_status == 404:
+        detail = body
+        if isinstance(body, dict):
+            detail = body.get("detail") or body.get("error") or body
+        if "no subscription found for account" in str(detail).lower():
+            # The subscriptions endpoint uses this explicit 404 when the
+            # authenticated account has no subscription. Treat it as a valid
+            # Free state so stale cached dates/renewal flags are cleared.
+            return {
+                "status": "OK",
+                "source": "subscriptions",
+                "plan_type": "free",
+                "subscription_until": None,
+                "will_renew": False,
+                "is_delinquent": False,
+            }
     if http_status >= 400:
         detail = body
         if isinstance(body, dict):
@@ -1783,10 +1860,10 @@ def _probe_codex_oauth(profile_name, timeout=35):
         # 即使 WebSocket 诊断失败，也要先检查 CLI 是否已安全写入新凭据；旧逻辑
         # 在 warning 处提前返回，会丢掉已经完成的令牌轮换。
         refreshed = _read_auth_json(temp_auth)
-        refreshed_account = str((refreshed.get("tokens") or {}).get("account_id") or "")
-        if original_account and refreshed_account != original_account:
+        matched, reason = _auth_identities_match(original, refreshed)
+        if not matched:
             return {
-                "status": "OAuth Identity Mismatch: account_id",
+                "status": f"OAuth Identity Mismatch: {reason}",
                 "source": "codex-doctor",
             }
         with open(auth_path, "rb") as original_file, open(temp_auth, "rb") as refreshed_file:

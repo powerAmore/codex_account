@@ -304,6 +304,59 @@ class QuotaParsingTests(unittest.TestCase):
         self.assertTrue(result["is_delinquent"])
         self.assertEqual(result["grace_period_end"], "2026-08-04T19:38:08Z")
 
+    def test_subscription_not_found_means_free_without_error(self):
+        result = codex_mgr._parse_subscription_fetch_result(
+            {
+                "kind": "http",
+                "status": 404,
+                "body": {"detail": "No subscription found for account"},
+            }
+        )
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["plan_type"], "free")
+        self.assertIsNone(result["subscription_until"])
+        self.assertFalse(result["will_renew"])
+        self.assertFalse(result["is_delinquent"])
+
+    def test_subscription_not_found_clears_stale_subscription_cache(self):
+        subscription = codex_mgr._parse_subscription_fetch_result(
+            {
+                "kind": "http",
+                "status": 404,
+                "body": {"detail": "No subscription found for account"},
+            }
+        )
+        result = codex_mgr._merge_subscription_into_quota_result(
+            {
+                "status": "OK",
+                "plan_type": "plus",
+                "rate_limit": {"primary_window": {"limit_window_seconds": 2592000}},
+            },
+            subscription,
+        )
+        cache = {
+            "profile": {
+                "limits": {
+                    "status": "OK",
+                    "subscription_status": "OK",
+                    "plan_type": "plus",
+                    "subscription_until": "2026-11-08T02:17:14Z",
+                    "will_renew": True,
+                    "is_delinquent": True,
+                    "grace_period_end": "2026-11-01T00:00:00Z",
+                },
+                "timestamp": 100,
+            }
+        }
+        codex_mgr._record_usage_result(cache, "profile", result, timestamp=200)
+        limits = cache["profile"]["limits"]
+        self.assertEqual(limits["subscription_status"], "OK")
+        self.assertEqual(limits["plan_type"], "free")
+        self.assertIsNone(limits["subscription_until"])
+        self.assertFalse(limits["will_renew"])
+        self.assertFalse(limits["is_delinquent"])
+        self.assertNotIn("grace_period_end", limits)
+
     def test_subscription_merge_failure_does_not_break_quota(self):
         merged = codex_mgr._merge_subscription_into_quota_result(
             {"status": "OK", "rate_limit": {}, "plan_type": "plus"},
@@ -650,6 +703,39 @@ class CredentialSyncTests(unittest.TestCase):
             ok, action = codex_mgr._sync_auth_snapshot(str(source), str(target))
         self.assertFalse(ok)
         self.assertEqual(action, "identity-mismatch")
+    def test_same_user_different_workspace_allows_sync(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = pathlib.Path(temp_dir, "source.json")
+            target = pathlib.Path(temp_dir, "target.json")
+            source_id_token = ProfileNamingTests._jwt({
+                "sub": "auth0|user-123",
+                "email": "user@example.com",
+                "https://api.openai.com/auth": {"user_id": "user-123"},
+            })
+            target_id_token = ProfileNamingTests._jwt({
+                "sub": "auth0|user-123",
+                "email": "user@example.com",
+                "https://api.openai.com/auth": {"user_id": "user-123"},
+            })
+            source.write_text(json.dumps({
+                "last_refresh": "2026-10-15T10:00:00Z",
+                "tokens": {
+                    "account_id": "workspace-free",
+                    "id_token": source_id_token,
+                },
+            }))
+            target.write_text(json.dumps({
+                "last_refresh": "2026-10-14T10:00:00Z",
+                "tokens": {
+                    "account_id": "workspace-team",
+                    "id_token": target_id_token,
+                },
+            }))
+            ok, action = codex_mgr._sync_auth_snapshot(str(source), str(target))
+            self.assertTrue(ok)
+            self.assertEqual(action, "copied")
+            saved = json.loads(target.read_text())
+            self.assertEqual(saved["tokens"]["account_id"], "workspace-free")
 
 
 class ProfileNamingTests(unittest.TestCase):
